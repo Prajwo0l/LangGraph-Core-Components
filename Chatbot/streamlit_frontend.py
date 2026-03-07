@@ -21,6 +21,14 @@ def load_conversation(thread_id):
     state = chatbot.get_state(config={'configurable': {'thread_id': thread_id}})
     return state.values.get('messages', [])
 
+def messages_to_history(messages):
+    """Convert LangChain BaseMessage list into session_state-friendly dicts."""
+    result = []
+    for message in messages:
+        role = 'user' if isinstance(message, HumanMessage) else 'assistant'
+        result.append({'role': role, 'content': message.content})
+    return result
+
 def handle_delete(thread_id):
     """Delete thread from DB and session state, reset if it was the active chat."""
     delete_thread(thread_id)
@@ -29,16 +37,30 @@ def handle_delete(thread_id):
         reset_chat()
 
 # ------------------------ Session State Init ------------------------
-if 'message_history' not in st.session_state:
-    st.session_state['message_history'] = []
-
-if 'thread_id' not in st.session_state:
-    st.session_state['thread_id'] = generate_thread_id()
-
+# Always reload threads from SQLite on every page load / refresh so the
+# sidebar reflects what is actually persisted — not a stale in-memory copy.
 if 'chat_threads' not in st.session_state:
     st.session_state['chat_threads'] = retreive_all_threads()
 
+# Restore the active thread.  After a browser refresh session_state is empty,
+# so we fall back to the most-recently saved thread from the DB.
+if 'thread_id' not in st.session_state:
+    threads = st.session_state['chat_threads']
+    if threads:
+        # Last key = newest thread (list is ordered oldest→newest)
+        st.session_state['thread_id'] = list(threads.keys())[-1]
+    else:
+        st.session_state['thread_id'] = generate_thread_id()
+
+# Make sure the active thread is always registered in the sidebar dict
 add_thread(st.session_state['thread_id'])
+
+# Restore message history from SQLite whenever it is missing from session_state.
+# This covers the page-refresh case: the DB has the full history even though
+# session_state was wiped.
+if 'message_history' not in st.session_state:
+    messages = load_conversation(st.session_state['thread_id'])
+    st.session_state['message_history'] = messages_to_history(messages)
 
 # ------------------------ Display Chat History ------------------------
 for message in st.session_state['message_history']:
@@ -55,9 +77,10 @@ if st.sidebar.button('New Chat', key="new_chat"):
 st.sidebar.header("My Conversations")
 
 for thread_id, title in reversed(list(st.session_state['chat_threads'].items())):
-    # Skip empty unsaved chats that are not the active thread
+    # Skip unsaved new chats that are not currently active
     if title == "New Chat" and thread_id != st.session_state['thread_id']:
         continue
+
     display_title = title
     if thread_id == st.session_state['thread_id']:
         display_title = '👉' + title
@@ -67,14 +90,9 @@ for thread_id, title in reversed(list(st.session_state['chat_threads'].items()))
     with col1:
         if st.button(display_title, key=f"thread_{thread_id}"):
             st.session_state['thread_id'] = thread_id
+            # Always load from SQLite so switching threads is reliable
             messages = load_conversation(thread_id)
-            temp_messages = []
-
-            for message in messages:
-                role = 'user' if isinstance(message, HumanMessage) else 'assistant'
-                temp_messages.append({'role': role, 'content': message.content})
-
-            st.session_state['message_history'] = temp_messages
+            st.session_state['message_history'] = messages_to_history(messages)
             st.rerun()
 
     with col2:
@@ -87,20 +105,24 @@ user_input = st.chat_input('Type here')
 
 if user_input:
     current_thread_id = st.session_state['thread_id']
-    CONFIG = {'configurable': {'thread_id': current_thread_id}}
+    CONFIG = {'configurable': {'thread_id': current_thread_id},
+              'metadata':{
+                  'thread_id':current_thread_id},
+                  'run_name':'chat_turn',
+              }
 
-    # Update title only for new chat
+    # Update title only for brand-new chats
     current_title = st.session_state['chat_threads'][current_thread_id]
     if current_title == "New Chat":
         current_title = user_input.strip()[:30]
         st.session_state['chat_threads'][current_thread_id] = current_title
 
-    # Store user message
+    # Store and display user message
     st.session_state['message_history'].append({'role': 'user', 'content': user_input})
     with st.chat_message("user"):
         st.text(user_input)
 
-    # Generate assistant response
+    # Generate and stream assistant response
     response_text = ""
     with st.chat_message("assistant"):
         message_placeholder = st.empty()
@@ -117,3 +139,5 @@ if user_input:
 
     # Store assistant message
     st.session_state['message_history'].append({'role': 'assistant', 'content': response_text})
+
+    

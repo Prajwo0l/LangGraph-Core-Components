@@ -6,7 +6,11 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph.message import add_messages
 import sqlite3
 from dotenv import load_dotenv
+import os
 
+
+
+os.environ['LANGCHAIN_PROJECT']='Personal Chatbot'
 load_dotenv()
 
 # ------------------------ ChatState ------------------------
@@ -37,15 +41,26 @@ chatbot = graph.compile(checkpointer=checkpointer)
 # ------------------------ Retrieve all threads ------------------------
 def retreive_all_threads():
     """
-    Returns all threads as {thread_id: title}.
-    Pulls 'title' from the checkpoint values for persistence.
+    Returns all threads as {thread_id: title}, ordered oldest→newest.
+    Uses only the LATEST checkpoint per thread to get the most up-to-date title.
+    checkpointer.list() yields checkpoints newest-first, so the first time
+    we see a thread_id is always the most recent checkpoint for that thread.
+    We collect them in seen order, then reverse so oldest is first (index 0)
+    and newest is last — matching the original sidebar display logic.
     """
-    thread_dict = {}
+    seen = {}   # thread_id -> title, insertion order = newest checkpoint first
+
     for checkpoint in checkpointer.list(None):
         thread_id = checkpoint.config['configurable'].get('thread_id')
-        title = checkpoint.checkpoint.get('channel_values', {}).get('title', 'New Chat')  # fallback to 'New Chat'
-        thread_dict[thread_id] = title
-    return thread_dict
+        if thread_id in seen:
+            # Already captured the latest checkpoint for this thread — skip older ones
+            continue
+        title = checkpoint.checkpoint.get('channel_values', {}).get('title', 'New Chat')
+        seen[thread_id] = title
+
+    # Reverse so the dict is oldest→newest (sidebar shows reversed list, newest at top)
+    return dict(reversed(list(seen.items())))
+
 # ------------------------ Delete a thread ------------------------
 def delete_thread(thread_id):
     """
