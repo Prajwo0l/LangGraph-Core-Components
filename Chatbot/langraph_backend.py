@@ -7,6 +7,19 @@ from langgraph.graph.message import add_messages
 import sqlite3
 from dotenv import load_dotenv
 import os
+from langgraph.graph import StateGraph ,START,END
+from typing import TypedDict,Annotated
+from langchain_core.messages import BaseMessage,HumanMessage
+from langchain_openai import ChatOpenAI
+from langgraph.graph.message import add_messages
+from dotenv import load_dotenv
+
+from langgraph.prebuilt import ToolNode,tools_condition
+from langchain_community.tools import DuckDuckGoSearchRun
+from langchain_core.tools import tool
+
+import requests
+import random
 
 
 
@@ -30,11 +43,76 @@ def chat_node(state: ChatState):
 connect = sqlite3.connect(database='chatbot.db', check_same_thread=False)
 checkpointer = SqliteSaver(conn=connect)
 
+
+# ------------------------ Tools ------------------------
+search_tool=DuckDuckGoSearchRun(region='us-en')
+
+@tool
+def calculator(expression: str) -> dict:
+    """
+    Evaluate a mathematical expression safely.
+
+    Args:
+        expression (str): A string containing a basic arithmetic expression 
+                          (e.g., "396.73 * 50"). Supports +, -, *, /.
+
+    Returns:
+        dict: A dictionary with:
+            - 'expression' (str): The expression that was evaluated.
+            - 'result' (float): The calculated result.
+            - 'error' (str, optional): Error message if the calculation failed.
+
+    """
+    try:
+        result = float(eval(expression))
+        return {"expression": expression, "result": result}
+    except Exception as e:
+        return {"error": str(e)}
+
+@tool
+def get_stock_price(symbol: str) -> dict:
+    """
+    Fetch latest stock price for a given symbol (e.g. AAPL, TSLA)
+    """
+    url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey=CE8MY894ND1ESUK5"
+    
+    r = requests.get(url).json()
+    
+    try:
+        price = float(r["Global Quote"]["05. price"])
+        return {"symbol": symbol, "price": price}
+    except:
+        return {"error": "Could not fetch stock price"}
+    
+
+#Making tool list
+tools=[get_stock_price,search_tool,calculator]
+
+# Make the LLM tool_aware
+llm_with_tools=llm.bind_tools(tools)
+
+def chat_node(state:ChatState):
+    '''
+    LLM node that may answer or request a tool call.
+    '''
+    messages=state['messages']
+    response=llm_with_tools.invoke(messages)
+    return {'messages':[response]}
+
+
+tool_node=ToolNode(tools)
+
 # ------------------------ Graph ------------------------
-graph = StateGraph(ChatState)
-graph.add_node('chat_node', chat_node)
-graph.add_edge(START, 'chat_node')
-graph.add_edge('chat_node', END)
+graph=StateGraph(ChatState)
+graph.add_node('chat_node',chat_node)
+graph.add_node('tools',tool_node)
+
+graph.add_edge(START,'chat_node')
+graph.add_conditional_edges('chat_node',tools_condition)
+graph.add_edge('tools','chat_node')
+
+chatbot=graph.compile()
+chatbot
 
 chatbot = graph.compile(checkpointer=checkpointer)
 

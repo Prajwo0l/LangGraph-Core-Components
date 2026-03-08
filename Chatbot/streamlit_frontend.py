@@ -1,6 +1,7 @@
 import streamlit as st
 from langraph_backend import chatbot, retreive_all_threads, delete_thread
 from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessageChunk, ToolMessage
 import uuid
 
 # ------------------------ Utilities ------------------------
@@ -64,8 +65,9 @@ if 'message_history' not in st.session_state:
 
 # ------------------------ Display Chat History ------------------------
 for message in st.session_state['message_history']:
-    with st.chat_message(message['role']):
-        st.text(message['content'])
+    if message['content']:
+        with st.chat_message(message['role']):
+            st.markdown(message['content'])
 
 # ------------------------ Sidebar ------------------------
 st.sidebar.title("SideBar")
@@ -117,27 +119,42 @@ if user_input:
         current_title = user_input.strip()[:30]
         st.session_state['chat_threads'][current_thread_id] = current_title
 
-    # Store and display user message
+    # Store user message (no display)
     st.session_state['message_history'].append({'role': 'user', 'content': user_input})
-    with st.chat_message("user"):
-        st.text(user_input)
 
     # Generate and stream assistant response
     response_text = ""
     with st.chat_message("assistant"):
         message_placeholder = st.empty()
+        status_placeholder = st.empty()
 
         for message_chunk, metadata in chatbot.stream(
             {'messages': [HumanMessage(content=user_input)], 'title': current_title},
             config=CONFIG,
             stream_mode='messages'
         ):
-            chunk = message_chunk.content
-            if chunk:
-                response_text += chunk
-                message_placeholder.markdown(response_text)
+            # ---- Tool call detected — show status container ----
+            if hasattr(message_chunk, 'tool_calls') and message_chunk.tool_calls:
+                for tool_call in message_chunk.tool_calls:
+                    tool_name = tool_call.get('name', 'tool')
+                    with status_placeholder.status(f"🔧 Using tool: `{tool_name}`...", expanded=False) as s:
+                        st.write(f"**Tool:** `{tool_name}`")
+                        st.write(f"**Input:** `{tool_call.get('args', {})}`")
+                        s.update(label=f"✅ `{tool_name}` done", state="complete", expanded=False)
+
+            # ---- Tool result — update status with output ----
+            elif isinstance(message_chunk, ToolMessage):
+                tool_name = metadata.get('name', 'tool')
+                with status_placeholder.status(f"✅ `{tool_name}` result received", expanded=False) as s:
+                    st.write(f"**Result:** `{message_chunk.content}`")
+                    s.update(label=f"✅ `{tool_name}` result received", state="complete", expanded=False)
+
+            # ---- Regular AI text chunk — stream it ----
+            else:
+                chunk = message_chunk.content
+                if chunk:
+                    response_text += chunk
+                    message_placeholder.markdown(response_text)
 
     # Store assistant message
     st.session_state['message_history'].append({'role': 'assistant', 'content': response_text})
-
-    
