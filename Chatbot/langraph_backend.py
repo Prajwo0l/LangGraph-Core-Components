@@ -15,8 +15,8 @@ from langgraph.graph.message import add_messages
 from dotenv import load_dotenv
 
 from langgraph.prebuilt import ToolNode,tools_condition
-from langchain_community.tools import DuckDuckGoSearchRun
 from langchain_core.tools import tool
+from ddgs import DDGS
 
 import requests
 import random
@@ -45,7 +45,28 @@ checkpointer = SqliteSaver(conn=connect)
 
 
 # ------------------------ Tools ------------------------
-search_tool=DuckDuckGoSearchRun(region='us-en')
+@tool
+def search_tool(query: str) -> str:
+    """
+    Search the web using DuckDuckGo and return the top results.
+
+    Args:
+        query (str): The search query string.
+
+    Returns:
+        str: A formatted string of the top search results including title, URL, and snippet.
+    """
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, region='us-en', max_results=5))
+        if not results:
+            return "No results found for the given query."
+        formatted = []
+        for r in results:
+            formatted.append(f"Title: {r.get('title', '')}\nURL: {r.get('href', '')}\nSnippet: {r.get('body', '')}")
+        return "\n\n".join(formatted)
+    except Exception as e:
+        return f"Search error: {str(e)}"
 
 @tool
 def calculator(expression: str) -> dict:
@@ -86,7 +107,7 @@ def get_stock_price(symbol: str) -> dict:
     
 
 #Making tool list
-tools=[get_stock_price,search_tool,calculator]
+tools=[get_stock_price, search_tool, calculator]
 
 # Make the LLM tool_aware
 llm_with_tools=llm.bind_tools(tools)

@@ -4,6 +4,33 @@ from langchain_core.messages import HumanMessage
 from langchain_core.messages import AIMessageChunk, ToolMessage
 import uuid
 
+# ------------------------ Page Config ------------------------
+st.set_page_config(
+    page_title="My Chatbot",
+    page_icon="🤖",
+    layout="centered",
+)
+
+# Hide the broken Material Icons sidebar toggle and replace with a clean CSS arrow
+st.markdown(
+    """
+    <style>
+    /* Hide the default broken icon text button */
+    button[data-testid="collapsedControl"] {
+        display: none !important;
+    }
+    /* Also hide the expand arrow that shows the icon name as text */
+    [data-testid="stSidebarCollapsedControl"] {
+        display: none !important;
+    }
+    div[data-testid="collapsedControl"] {
+        display: none !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 # ------------------------ Utilities ------------------------
 def generate_thread_id():
     return str(uuid.uuid4())
@@ -23,11 +50,27 @@ def load_conversation(thread_id):
     return state.values.get('messages', [])
 
 def messages_to_history(messages):
-    """Convert LangChain BaseMessage list into session_state-friendly dicts."""
+    """Convert LangChain BaseMessage list into session_state-friendly dicts.
+    Skips ToolMessages and AI messages that only contain tool calls (no text).
+    """
     result = []
     for message in messages:
-        role = 'user' if isinstance(message, HumanMessage) else 'assistant'
-        result.append({'role': role, 'content': message.content})
+        if isinstance(message, HumanMessage):
+            if message.content:
+                result.append({'role': 'user', 'content': message.content})
+        elif isinstance(message, ToolMessage):
+            # Skip raw tool output — not meant for display in history
+            continue
+        else:
+            # AIMessage: only include if it has actual text content (not just a tool call)
+            content = message.content
+            if isinstance(content, list):
+                # Extract text parts only
+                text = ' '.join(part.get('text', '') for part in content if isinstance(part, dict) and part.get('type') == 'text')
+            else:
+                text = content or ''
+            if text.strip():
+                result.append({'role': 'assistant', 'content': text})
     return result
 
 def handle_delete(thread_id):
@@ -119,7 +162,9 @@ if user_input:
         current_title = user_input.strip()[:30]
         st.session_state['chat_threads'][current_thread_id] = current_title
 
-    # Store user message (no display)
+    # Display and store user message immediately
+    with st.chat_message("user"):
+        st.markdown(user_input)
     st.session_state['message_history'].append({'role': 'user', 'content': user_input})
 
     # Generate and stream assistant response
