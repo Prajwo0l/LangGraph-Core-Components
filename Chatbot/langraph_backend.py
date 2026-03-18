@@ -13,11 +13,11 @@ from langchain_core.messages import BaseMessage,HumanMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph.message import add_messages
 from dotenv import load_dotenv
-
+from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.prebuilt import ToolNode,tools_condition
 from langchain_core.tools import tool
 from ddgs import DDGS
-
+import asyncio
 import requests
 import random
 
@@ -32,7 +32,7 @@ class ChatState(TypedDict):
     title: str  # persist thread title
 
 # ------------------------ LLM Node ------------------------
-llm = ChatOpenAI()
+llm = ChatOpenAI(max_retries=2)
 
 def chat_node(state: ChatState):
     messages = state['messages']
@@ -104,10 +104,20 @@ def get_stock_price(symbol: str) -> dict:
         return {"symbol": symbol, "price": price}
     except:
         return {"error": "Could not fetch stock price"}
-    
 
+async def load_mcp_tools():
+    client = MultiServerMCPClient({
+        'expense_tracker':{
+            'command': r'C:\Users\lamic\Desktop\Expense MCP Server\.venv\Scripts\python.exe',
+            'args': [r'C:\Users\lamic\Desktop\Expense MCP Server\main.py'],
+            'transport':'stdio',
+        }
+    })
+    return await client.get_tools()
+
+mcp_tools = asyncio.run(load_mcp_tools())
 #Making tool list
-tools=[get_stock_price, search_tool, calculator]
+tools=[get_stock_price, search_tool, calculator]+mcp_tools
 
 # Make the LLM tool_aware
 llm_with_tools=llm.bind_tools(tools)
@@ -121,7 +131,52 @@ def chat_node(state:ChatState):
     return {'messages':[response]}
 
 
-tool_node=ToolNode(tools)
+# Custom ToolNode that unwraps MCP's [{type, text, id}] format into plain text
+from langchain_core.messages import ToolMessage
+
+import asyncio
+import json
+
+async def _run_tool(tool, args):
+    """Run a tool — async if supported, sync fallback otherwise."""
+    try:
+        raw = await tool.ainvoke(args)
+    except NotImplementedError:
+        raw = tool.invoke(args)
+    # Unwrap MCP list format: [{type, text, id}] -> plain text
+    if isinstance(raw, list):
+        return ' '.join(
+            block.get('text', str(block))
+            for block in raw
+            if isinstance(block, dict)
+        )
+    elif isinstance(raw, dict):
+        return json.dumps(raw)
+    return str(raw)
+
+def clean_tool_node(state: ChatState):
+    last_message = state['messages'][-1]
+    tool_results = []
+
+    for tool_call in last_message.tool_calls:
+        tool_name = tool_call['name']
+        tool_args = tool_call['args']
+        tool_call_id = tool_call['id']
+
+        matched_tool = next((t for t in tools if t.name == tool_name), None)
+        if matched_tool is None:
+            result = f'Tool {tool_name} not found'
+        else:
+            try:
+                result = asyncio.run(_run_tool(matched_tool, tool_args))
+            except Exception as e:
+                result = f'Error: {str(e)}'
+
+        tool_results.append(ToolMessage(content=result, tool_call_id=tool_call_id))
+
+    return {'messages': tool_results}
+
+tool_node = clean_tool_node
 
 # ------------------------ Graph ------------------------
 graph=StateGraph(ChatState)
@@ -136,6 +191,9 @@ chatbot=graph.compile()
 chatbot
 
 chatbot = graph.compile(checkpointer=checkpointer)
+
+# Wrap stream with a recursion limit so tool failures stop gracefully
+CHATBOT_CONFIG_DEFAULTS = {'recursion_limit': 10}
 
 # ------------------------ Retrieve all threads ------------------------
 def retreive_all_threads():
