@@ -1,6 +1,10 @@
+from __future__ import annotations
 from langgraph.graph import StateGraph, START, END
-from typing import TypedDict, Annotated
+from typing import TypedDict, Annotated,Any,Dict,Optional
 from langchain_core.messages import BaseMessage, HumanMessage
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+from langchain_community.document_loaders import PyPDFLoader
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph.message import add_messages
@@ -10,21 +14,30 @@ import os
 from langgraph.graph import StateGraph ,START,END
 from typing import TypedDict,Annotated
 from langchain_core.messages import BaseMessage,HumanMessage
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI,OpenAIEmbeddings
 from langgraph.graph.message import add_messages
 from dotenv import load_dotenv
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langgraph.prebuilt import ToolNode,tools_condition
+from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_core.tools import tool
 from ddgs import DDGS
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
 import asyncio
 import requests
-import random
+import tempfile
+import os
 
 
 
 os.environ['LANGCHAIN_PROJECT']='Personal Chatbot'
 load_dotenv()
+
+# Suppress noisy pypdf float warnings from malformed PDFs
+import warnings
+warnings.filterwarnings('ignore', message='could not convert string to float')
 
 # ------------------------ ChatState ------------------------
 class ChatState(TypedDict):
@@ -33,11 +46,68 @@ class ChatState(TypedDict):
 
 # ------------------------ LLM Node ------------------------
 llm = ChatOpenAI(max_retries=2)
+embeddings=OpenAIEmbeddings(model='text-embedding-3-small')
 
 def chat_node(state: ChatState):
     messages = state['messages']
     response = llm.invoke(messages)
     return {'messages': [response], 'title': state['title']}  # persist title in state
+
+
+
+_THREAD_RETRIEVERS: Dict[str,Any]={}
+_THREAD_METADATA: Dict[str,dict]={}
+
+
+
+def _get_retriever(thread_id:Optional[str]):
+    'Fetch the retriever for a thread if available'
+    if thread_id and thread_id in _THREAD_RETRIEVERS:
+        return _THREAD_RETRIEVERS[thread_id]
+    return None
+
+def ingest_pdf(file_bytes:bytes,thread_id:str,filename:Optional[str]=None)->dict:
+    '''Build a FAISS retriever for the uploaded PDF and store it for the thread
+    
+    Returns a summary dict that can be surfaced in the UI
+    '''
+    if not file_bytes:
+        raise ValueError('No bytes received for ingestion.')
+    with tempfile.NamedTemporaryFile(delete=False,suffix=".pdf") as temp_file:
+        temp_file.write(file_bytes)
+        temp_path=temp_file.name
+    try:
+        loader=PyPDFLoader(temp_path)
+        docs=loader.load()
+
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,chunk_overlap=200,separators=["\n\n","\n"," ",""]
+
+        )
+        chunks=splitter.split_documents(docs)
+        vector_store = FAISS.from_documents(chunks,embeddings)
+        retriever=vector_store.as_retriever(
+            search_type='similarity',search_kwargs={'k':4}
+
+        )
+        _THREAD_RETRIEVERS[str(thread_id)]=retriever
+        _THREAD_METADATA[str(thread_id)]={
+            'filename':filename or os.path.basename(temp_path),
+            'documents':len(docs),
+            'chunks':len(chunks),
+        }
+
+        return {
+            'filename': filename or os.path.basename(temp_path),
+            'documents':len(docs),
+            'chunks':len(chunks),
+        }
+    finally:
+        #The Faiss store keeps copies of the text, so the temp file is safe to remove
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
 
 # ------------------------ SQLite Checkpointer ------------------------
 connect = sqlite3.connect(database='chatbot.db', check_same_thread=False)
@@ -104,6 +174,37 @@ def get_stock_price(symbol: str) -> dict:
         return {"symbol": symbol, "price": price}
     except:
         return {"error": "Could not fetch stock price"}
+    
+# Tracks which thread is currently active — set by the frontend before each stream
+_ACTIVE_THREAD_ID: Optional[str] = None
+
+def set_active_thread(thread_id: str):
+    """Called by the frontend before streaming so rag_tool knows which thread to use."""
+    global _ACTIVE_THREAD_ID
+    _ACTIVE_THREAD_ID = str(thread_id)
+
+@tool
+def rag_tool(query: str) -> dict:
+    '''
+    Retrieve relevant information from the uploaded PDF document.
+    Use this when the user asks questions about an uploaded document or PDF.
+    '''
+    retriever = _get_retriever(_ACTIVE_THREAD_ID)
+    if retriever is None:
+        return {
+            'error': 'No document uploaded for this chat. Please upload a PDF first.',
+            'query': query,
+        }
+    result = retriever.invoke(query)
+    context = [doc.page_content for doc in result]
+    metadata = [doc.metadata for doc in result]
+    return {
+        'query': query,
+        'context': context,
+        'metadata': metadata,
+        'source_file': _THREAD_METADATA.get(str(_ACTIVE_THREAD_ID), {}).get('filename'),
+    }
+
 
 async def load_mcp_tools():
     client = MultiServerMCPClient({
@@ -117,7 +218,7 @@ async def load_mcp_tools():
 
 mcp_tools = asyncio.run(load_mcp_tools())
 #Making tool list
-tools=[get_stock_price, search_tool, calculator]+mcp_tools
+tools=[get_stock_price, search_tool, calculator,rag_tool]+mcp_tools
 
 # Make the LLM tool_aware
 llm_with_tools=llm.bind_tools(tools)
@@ -235,3 +336,9 @@ def delete_thread(thread_id):
             connect.execute(f"DELETE FROM {table} WHERE thread_id = ?", (thread_id,))
 
     connect.commit()
+
+def thread_has_document(thread_id:str)->bool:
+    return str(thread_id) in _THREAD_RETRIEVERS
+
+def thread_document_metadata(thread_id:str)-> dict:
+    return _THREAD_METADATA.get(str(thread_id),{})
