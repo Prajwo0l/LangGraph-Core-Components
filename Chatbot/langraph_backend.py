@@ -48,10 +48,7 @@ class ChatState(TypedDict):
 llm = ChatOpenAI(max_retries=2)
 embeddings=OpenAIEmbeddings(model='text-embedding-3-small')
 
-def chat_node(state: ChatState):
-    messages = state['messages']
-    response = llm.invoke(messages)
-    return {'messages': [response], 'title': state['title']}  # persist title in state
+# chat_node is defined below after tools are loaded
 
 
 
@@ -211,7 +208,8 @@ async def load_mcp_tools():
         'expense_tracker':{
             'command': r'C:\Users\lamic\Desktop\Expense MCP Server\.venv\Scripts\python.exe',
             'args': [r'C:\Users\lamic\Desktop\Expense MCP Server\main.py'],
-            'transport':'stdio',
+            'transport': 'stdio',
+            'cwd': r'C:\Users\lamic\Desktop\Expense MCP Server',  # run from its own folder
         }
     })
     return await client.get_tools()
@@ -227,8 +225,16 @@ def chat_node(state:ChatState):
     '''
     LLM node that may answer or request a tool call.
     '''
-    messages=state['messages']
-    response=llm_with_tools.invoke(messages)
+    from datetime import date
+    from langchain_core.messages import SystemMessage
+    today = date.today().strftime('%Y-%m-%d')
+    system = SystemMessage(content=f"""You are Pattie, a helpful personal AI assistant.
+Today's date is {today}.
+When adding expenses, always use today's date ({today}) if the user does not specify one.
+Always pass all required arguments when calling tools — never call a tool with empty arguments.
+""")
+    messages = [system] + state['messages']
+    response = llm_with_tools.invoke(messages)
     return {'messages':[response]}
 
 
