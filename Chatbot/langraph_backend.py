@@ -1,350 +1,405 @@
+# =============================================================================
+# langraph_backend.py  —  Pattie AI Assistant Backend
+# =============================================================================
 from __future__ import annotations
-from langgraph.graph import StateGraph, START, END
-from typing import TypedDict, Annotated,Any,Dict,Optional
-from langchain_core.messages import BaseMessage, HumanMessage
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_openai import ChatOpenAI
-from langgraph.checkpoint.sqlite import SqliteSaver
-from langgraph.graph.message import add_messages
-import sqlite3
-from dotenv import load_dotenv
-import os
-from langgraph.graph import StateGraph ,START,END
-from typing import TypedDict,Annotated
-from langchain_core.messages import BaseMessage,HumanMessage
-from langchain_openai import ChatOpenAI,OpenAIEmbeddings
-from langgraph.graph.message import add_messages
-from dotenv import load_dotenv
-from langchain_mcp_adapters.client import MultiServerMCPClient
-from langgraph.prebuilt import ToolNode, tools_condition
-from langchain_core.tools import tool
-from ddgs import DDGS
-from langchain_openai import OpenAIEmbeddings
-from langchain_community.document_loaders import PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
+
+# ── Standard library ──
 import asyncio
-import requests
-import tempfile
+import json
 import os
-
-
-
-os.environ['LANGCHAIN_PROJECT']='Personal Chatbot'
-load_dotenv()
-
-# Suppress noisy pypdf float warnings from malformed PDFs
+import sqlite3
+import tempfile
 import warnings
+from datetime import date
+from typing import Annotated, Any, Dict, Optional
+
+# ── Third-party ──
+import requests
+from dotenv import load_dotenv
+from ddgs import DDGS
+
+# ── LangChain / LangGraph ──
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.vectorstores import FAISS
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.tools import tool
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import tools_condition
+from typing import TypedDict
+
+# ── Environment ──
+load_dotenv()
+os.environ['LANGCHAIN_PROJECT'] = 'Personal Chatbot'
 warnings.filterwarnings('ignore', message='could not convert string to float')
 
-# ------------------------ ChatState ------------------------
+
+# =============================================================================
+# State
+# =============================================================================
 class ChatState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
-    title: str  # persist thread title
+    title: str
+    intent: str  # set by intent_router: expense | search | document | finance | general
 
-# ------------------------ LLM Node ------------------------
-llm = ChatOpenAI(max_retries=2)
-embeddings=OpenAIEmbeddings(model='text-embedding-3-small')
-
-# chat_node is defined below after tools are loaded
+# Default state values for new threads
+DEFAULT_STATE: dict = {'title': 'New Chat', 'intent': 'general'}
 
 
+# =============================================================================
+# Models
+# =============================================================================
+llm = ChatOpenAI(model='gpt-4o-mini', max_retries=2)
+embeddings = OpenAIEmbeddings(model='text-embedding-3-small')
 
-_THREAD_RETRIEVERS: Dict[str,Any]={}
-_THREAD_METADATA: Dict[str,dict]={}
+
+# =============================================================================
+# RAG  —  per-thread PDF retriever store
+# =============================================================================
+_THREAD_RETRIEVERS: Dict[str, Any] = {}
+_THREAD_METADATA: Dict[str, dict] = {}
+_ACTIVE_THREAD_ID: Optional[str] = None
 
 
+def set_active_thread(thread_id: str) -> None:
+    """Call this before every chat stream so rag_tool uses the right retriever."""
+    global _ACTIVE_THREAD_ID
+    _ACTIVE_THREAD_ID = str(thread_id)
 
-def _get_retriever(thread_id:Optional[str]):
-    'Fetch the retriever for a thread if available'
-    if thread_id and thread_id in _THREAD_RETRIEVERS:
-        return _THREAD_RETRIEVERS[thread_id]
-    return None
 
-def ingest_pdf(file_bytes:bytes,thread_id:str,filename:Optional[str]=None)->dict:
-    '''Build a FAISS retriever for the uploaded PDF and store it for the thread
-    
-    Returns a summary dict that can be surfaced in the UI
-    '''
+def thread_has_document(thread_id: str) -> bool:
+    return str(thread_id) in _THREAD_RETRIEVERS
+
+
+def thread_document_metadata(thread_id: str) -> dict:
+    return _THREAD_METADATA.get(str(thread_id), {})
+
+
+def ingest_pdf(file_bytes: bytes, thread_id: str, filename: Optional[str] = None) -> dict:
+    """Chunk a PDF, embed it, and store the retriever keyed by thread_id."""
     if not file_bytes:
         raise ValueError('No bytes received for ingestion.')
-    with tempfile.NamedTemporaryFile(delete=False,suffix=".pdf") as temp_file:
-        temp_file.write(file_bytes)
-        temp_path=temp_file.name
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
+        tmp.write(file_bytes)
+        tmp_path = tmp.name
+
     try:
-        loader=PyPDFLoader(temp_path)
-        docs=loader.load()
-
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,chunk_overlap=200,separators=["\n\n","\n"," ",""]
-
+        docs = PyPDFLoader(tmp_path).load()
+        chunks = RecursiveCharacterTextSplitter(
+            chunk_size=1000, chunk_overlap=200,
+            separators=['\n\n', '\n', ' ', '']
+        ).split_documents(docs)
+        retriever = FAISS.from_documents(chunks, embeddings).as_retriever(
+            search_type='similarity', search_kwargs={'k': 4}
         )
-        chunks=splitter.split_documents(docs)
-        vector_store = FAISS.from_documents(chunks,embeddings)
-        retriever=vector_store.as_retriever(
-            search_type='similarity',search_kwargs={'k':4}
-
-        )
-        _THREAD_RETRIEVERS[str(thread_id)]=retriever
-        _THREAD_METADATA[str(thread_id)]={
-            'filename':filename or os.path.basename(temp_path),
-            'documents':len(docs),
-            'chunks':len(chunks),
+        _THREAD_RETRIEVERS[str(thread_id)] = retriever
+        _THREAD_METADATA[str(thread_id)] = {
+            'filename': filename or os.path.basename(tmp_path),
+            'documents': len(docs),
+            'chunks': len(chunks),
         }
-
-        return {
-            'filename': filename or os.path.basename(temp_path),
-            'documents':len(docs),
-            'chunks':len(chunks),
-        }
+        return _THREAD_METADATA[str(thread_id)]
     finally:
-        #The Faiss store keeps copies of the text, so the temp file is safe to remove
         try:
-            os.remove(temp_path)
+            os.remove(tmp_path)
         except OSError:
             pass
 
-# ------------------------ SQLite Checkpointer ------------------------
-connect = sqlite3.connect(database='chatbot.db', check_same_thread=False)
-checkpointer = SqliteSaver(conn=connect)
+
+# =============================================================================
+# SQLite checkpointer
+# =============================================================================
+_db_conn = sqlite3.connect(database='chatbot.db', check_same_thread=False)
+checkpointer = SqliteSaver(conn=_db_conn)
 
 
-# ------------------------ Tools ------------------------
+# =============================================================================
+# Tools
+# =============================================================================
 @tool
 def search_tool(query: str) -> str:
-    """
-    Search the web using DuckDuckGo and return the top results.
-
-    Args:
-        query (str): The search query string.
-
-    Returns:
-        str: A formatted string of the top search results including title, URL, and snippet.
-    """
+    """Search the web using DuckDuckGo. Use for current events or factual lookups."""
     try:
         with DDGS() as ddgs:
             results = list(ddgs.text(query, region='us-en', max_results=5))
         if not results:
-            return "No results found for the given query."
-        formatted = []
-        for r in results:
-            formatted.append(f"Title: {r.get('title', '')}\nURL: {r.get('href', '')}\nSnippet: {r.get('body', '')}")
-        return "\n\n".join(formatted)
-    except Exception as e:
-        return f"Search error: {str(e)}"
+            return 'No results found.'
+        return '\n\n'.join(
+            f"Title: {r.get('title', '')}\nURL: {r.get('href', '')}\nSnippet: {r.get('body', '')}"
+            for r in results
+        )
+    except Exception as exc:
+        return f'Search error: {exc}'
+
 
 @tool
 def calculator(expression: str) -> dict:
     """
-    Evaluate a mathematical expression safely.
-
-    Args:
-        expression (str): A string containing a basic arithmetic expression 
-                          (e.g., "396.73 * 50"). Supports +, -, *, /.
-
-    Returns:
-        dict: A dictionary with:
-            - 'expression' (str): The expression that was evaluated.
-            - 'result' (float): The calculated result.
-            - 'error' (str, optional): Error message if the calculation failed.
-
+    Safely evaluate a basic arithmetic expression (+, -, *, /, **, %).
+    Example: '396.73 * 50'  or  '(100 + 200) / 3'
     """
+    # Whitelist: only allow digits, operators, spaces, dots, parentheses
+    allowed = set('0123456789+-*/.() %**\t\n')
+    if not all(c in allowed for c in expression):
+        return {'error': 'Expression contains invalid characters.'}
     try:
-        result = float(eval(expression))
-        return {"expression": expression, "result": result}
-    except Exception as e:
-        return {"error": str(e)}
+        result = float(eval(expression, {'__builtins__': {}}, {}))
+        return {'expression': expression, 'result': result}
+    except Exception as exc:
+        return {'error': str(exc)}
+
 
 @tool
 def get_stock_price(symbol: str) -> dict:
-    """
-    Fetch latest stock price for a given symbol (e.g. AAPL, TSLA)
-    """
-    url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey=CE8MY894ND1ESUK5"
-    
-    r = requests.get(url).json()
-    
+    """Fetch the latest stock price for a ticker symbol (e.g. AAPL, TSLA, AMZN)."""
+    url = (
+        f'https://www.alphavantage.co/query'
+        f'?function=GLOBAL_QUOTE&symbol={symbol}&apikey=CE8MY894ND1ESUK5'
+    )
     try:
-        price = float(r["Global Quote"]["05. price"])
-        return {"symbol": symbol, "price": price}
-    except:
-        return {"error": "Could not fetch stock price"}
-    
-# Tracks which thread is currently active — set by the frontend before each stream
-_ACTIVE_THREAD_ID: Optional[str] = None
+        data = requests.get(url, timeout=10).json()
+        price = float(data['Global Quote']['05. price'])
+        return {'symbol': symbol, 'price': price}
+    except Exception:
+        return {'error': f'Could not fetch stock price for {symbol}.'}
 
-def set_active_thread(thread_id: str):
-    """Called by the frontend before streaming so rag_tool knows which thread to use."""
-    global _ACTIVE_THREAD_ID
-    _ACTIVE_THREAD_ID = str(thread_id)
 
 @tool
 def rag_tool(query: str) -> dict:
-    '''
-    Retrieve relevant information from the uploaded PDF document.
-    Use this when the user asks questions about an uploaded document or PDF.
-    '''
-    retriever = _get_retriever(_ACTIVE_THREAD_ID)
+    """
+    Retrieve relevant passages from the PDF document uploaded in this chat.
+    Use this whenever the user asks questions about an uploaded file or document.
+    """
+    retriever = _THREAD_RETRIEVERS.get(_ACTIVE_THREAD_ID)
     if retriever is None:
-        return {
-            'error': 'No document uploaded for this chat. Please upload a PDF first.',
-            'query': query,
-        }
-    result = retriever.invoke(query)
-    context = [doc.page_content for doc in result]
-    metadata = [doc.metadata for doc in result]
+        return {'error': 'No document uploaded yet. Please upload a PDF first.'}
+    docs = retriever.invoke(query)
     return {
         'query': query,
-        'context': context,
-        'metadata': metadata,
-        'source_file': _THREAD_METADATA.get(str(_ACTIVE_THREAD_ID), {}).get('filename'),
+        'context': [d.page_content for d in docs],
+        'source_file': _THREAD_METADATA.get(_ACTIVE_THREAD_ID, {}).get('filename'),
     }
 
 
-async def load_mcp_tools():
+# =============================================================================
+# MCP tools  (Expense Tracker)
+# =============================================================================
+async def _load_mcp_tools() -> list:
     client = MultiServerMCPClient({
-        'expense_tracker':{
+        'expense_tracker': {
             'command': r'C:\Users\lamic\Desktop\Expense MCP Server\.venv\Scripts\python.exe',
             'args': [r'C:\Users\lamic\Desktop\Expense MCP Server\main.py'],
             'transport': 'stdio',
-            'cwd': r'C:\Users\lamic\Desktop\Expense MCP Server',  # run from its own folder
+            'cwd': r'C:\Users\lamic\Desktop\Expense MCP Server',
         }
     })
     return await client.get_tools()
 
-mcp_tools = asyncio.run(load_mcp_tools())
-#Making tool list
-tools=[get_stock_price, search_tool, calculator,rag_tool]+mcp_tools
 
-# Make the LLM tool_aware
-llm_with_tools=llm.bind_tools(tools)
+try:
+    mcp_tools = asyncio.run(_load_mcp_tools())
+except Exception as exc:
+    print(f'[WARNING] Could not load MCP tools: {exc}')
+    mcp_tools = []
 
-def chat_node(state:ChatState):
-    '''
-    LLM node that may answer or request a tool call.
-    '''
-    from datetime import date
-    from langchain_core.messages import SystemMessage
+
+# =============================================================================
+# Tool registry — grouped by intent
+# =============================================================================
+
+# All tools flat list (used by tool_node executor)
+tools = [search_tool, calculator, get_stock_price, rag_tool] + mcp_tools
+
+# Pull out mcp tools by name for grouping
+_mcp_by_name = {t.name: t for t in mcp_tools}
+
+# Tool groups — each intent gets only the tools it needs
+TOOL_GROUPS: Dict[str, list] = {
+    # expense: add/list/summarize expenses + calendar
+    'expense': [t for t in mcp_tools],
+
+    # search: web search only
+    'search': [search_tool],
+
+    # document: RAG over uploaded PDF
+    'document': [rag_tool],
+
+    # finance: stock prices + calculator
+    'finance': [get_stock_price, calculator],
+
+    # general: no tools — pure conversation
+    'general': [],
+}
+
+# Pre-bind each group so we don't re-bind on every call
+_llm_by_intent: Dict[str, Any] = {
+    intent: llm.bind_tools(tool_list) if tool_list else llm
+    for intent, tool_list in TOOL_GROUPS.items()
+}
+
+# Fallback — all tools bound (used if intent is unknown)
+llm_with_tools = llm.bind_tools(tools)
+
+
+# =============================================================================
+# Graph nodes
+# =============================================================================
+
+# Fast small LLM just for intent classification
+_router_llm = ChatOpenAI(model='gpt-4o-mini', temperature=0, max_retries=2)
+
+INTENTS = ['expense', 'search', 'document', 'finance', 'general']
+
+def intent_router(state: ChatState) -> dict:
+    """
+    Classifies the latest user message into one of five intents.
+    This is a lightweight LLM call — no tools, just classification.
+
+    expense  — adding/listing/summarizing expenses
+    search   — searching the web for information
+    document — asking questions about an uploaded PDF
+    finance  — stock prices or math calculations
+    general  — casual chat, greetings, anything else
+    """
+    last_human = next(
+        (m.content for m in reversed(state['messages']) if isinstance(m, HumanMessage)),
+        ''
+    )
+
+    classification = _router_llm.invoke([
+        SystemMessage(content=(
+            'You are an intent classifier. Classify the user message into EXACTLY one of these intents:\n'
+            '- expense: user wants to add, list, or summarize expenses\n'
+            '- search: user wants to search the web or find current information\n'
+            '- document: user is asking about an uploaded PDF or document\n'
+            '- finance: user wants stock prices or math calculations\n'
+            '- general: casual conversation, greetings, or anything else\n\n'
+            'Reply with ONLY the intent word. No explanation. No punctuation.'
+        )),
+        HumanMessage(content=last_human),
+    ])
+
+    intent = classification.content.strip().lower()
+    if intent not in INTENTS:
+        intent = 'general'
+
+    return {'intent': intent}
+
+
+def chat_node(state: ChatState) -> dict:
+    """Main LLM node — uses only the tools relevant to the detected intent."""
     today = date.today().strftime('%Y-%m-%d')
-    system = SystemMessage(content=f"""You are Pattie, a helpful personal AI assistant.
-Today's date is {today}.
-When adding expenses, always use today's date ({today}) if the user does not specify one.
-Always pass all required arguments when calling tools — never call a tool with empty arguments.
-""")
-    messages = [system] + state['messages']
-    response = llm_with_tools.invoke(messages)
-    return {'messages':[response]}
+    intent = state.get('intent', 'general')
+
+    # Pick the right pre-bound LLM for this intent
+    active_llm = _llm_by_intent.get(intent, llm_with_tools)
+
+    # System prompt tailored per intent
+    intent_hints = {
+        'expense':  'You are helping the user track expenses. Use expense tools to add, list or summarize.',
+        'search':   'You are helping the user find information. Use the search tool to look things up.',
+        'document': 'You are helping the user understand an uploaded PDF. Use the rag_tool to retrieve context.',
+        'finance':  'You are helping the user with financial data. Use get_stock_price or calculator as needed.',
+        'general':  'You are having a friendly conversation. No tools needed unless the user asks explicitly.',
+    }
+
+    system = SystemMessage(content=(
+        f'You are Pattie, a helpful personal AI assistant.\n'
+        f"Today's date is {today}.\n"
+        f'When adding expenses, use {today} if the user does not specify a date.\n'
+        f'Always pass all required arguments when calling tools.\n'
+        f'Current task: {intent_hints.get(intent, "")}'
+    ))
+
+    response = active_llm.invoke([system] + state['messages'])
+    return {'messages': [response]}
 
 
-# Custom ToolNode that unwraps MCP's [{type, text, id}] format into plain text
-from langchain_core.messages import ToolMessage
-
-import asyncio
-import json
-
-async def _run_tool(tool, args):
-    """Run a tool — async if supported, sync fallback otherwise."""
+async def _invoke_tool(t: Any, args: dict) -> str:  # exported for direct use by frontend
+    """Invoke a tool async-first, fall back to sync. Unwrap MCP content blocks."""
     try:
-        raw = await tool.ainvoke(args)
+        raw = await t.ainvoke(args)
     except NotImplementedError:
-        raw = tool.invoke(args)
-    # Unwrap MCP list format: [{type, text, id}] -> plain text
-    if isinstance(raw, list):
+        raw = t.invoke(args)
+
+    if isinstance(raw, list):          # MCP returns [{type, text, id}, ...]
         return ' '.join(
-            block.get('text', str(block))
-            for block in raw
-            if isinstance(block, dict)
+            b.get('text', str(b)) for b in raw if isinstance(b, dict)
         )
-    elif isinstance(raw, dict):
+    if isinstance(raw, dict):
         return json.dumps(raw)
     return str(raw)
 
-def clean_tool_node(state: ChatState):
-    last_message = state['messages'][-1]
-    tool_results = []
 
-    for tool_call in last_message.tool_calls:
-        tool_name = tool_call['name']
-        tool_args = tool_call['args']
-        tool_call_id = tool_call['id']
-
-        matched_tool = next((t for t in tools if t.name == tool_name), None)
-        if matched_tool is None:
-            result = f'Tool {tool_name} not found'
+def tool_node(state: ChatState) -> dict:
+    """Execute every tool call in the last AI message."""
+    last = state['messages'][-1]
+    results = []
+    for call in last.tool_calls:
+        matched = next((t for t in tools if t.name == call['name']), None)
+        if matched is None:
+            content = f"Tool '{call['name']}' not found."
         else:
             try:
-                result = asyncio.run(_run_tool(matched_tool, tool_args))
-            except Exception as e:
-                result = f'Error: {str(e)}'
+                content = asyncio.run(_invoke_tool(matched, call['args']))
+            except Exception as exc:
+                content = f'Tool error: {exc}'
+        results.append(ToolMessage(content=content, tool_call_id=call['id']))
+    return {'messages': results}
 
-        tool_results.append(ToolMessage(content=result, tool_call_id=tool_call_id))
 
-    return {'messages': tool_results}
+# =============================================================================
+# Graph
+# =============================================================================
+_graph = StateGraph(ChatState)
 
-tool_node = clean_tool_node
+# Nodes
+_graph.add_node('intent_router', intent_router)
+_graph.add_node('chat_node', chat_node)
+_graph.add_node('tools', tool_node)
 
-# ------------------------ Graph ------------------------
-graph=StateGraph(ChatState)
-graph.add_node('chat_node',chat_node)
-graph.add_node('tools',tool_node)
+# Edges
+# 1. Every message starts with intent classification
+_graph.add_edge(START, 'intent_router')
 
-graph.add_edge(START,'chat_node')
-graph.add_conditional_edges('chat_node',tools_condition)
-graph.add_edge('tools','chat_node')
+# 2. After routing, always go to chat_node
+_graph.add_edge('intent_router', 'chat_node')
 
-chatbot=graph.compile()
-chatbot
+# 3. After chat_node: go to tools if there are tool calls, else END
+_graph.add_conditional_edges('chat_node', tools_condition)
 
-chatbot = graph.compile(checkpointer=checkpointer)
+# 4. After tools: back to chat_node (NOT intent_router — intent is already set)
+_graph.add_edge('tools', 'chat_node')
 
-# Wrap stream with a recursion limit so tool failures stop gracefully
-CHATBOT_CONFIG_DEFAULTS = {'recursion_limit': 10}
+chatbot = _graph.compile(checkpointer=checkpointer)
+CHATBOT_CONFIG_DEFAULTS = {'recursion_limit': 15}
 
-# ------------------------ Retrieve all threads ------------------------
-def retreive_all_threads():
-    """
-    Returns all threads as {thread_id: title}, ordered oldest→newest.
-    Uses only the LATEST checkpoint per thread to get the most up-to-date title.
-    checkpointer.list() yields checkpoints newest-first, so the first time
-    we see a thread_id is always the most recent checkpoint for that thread.
-    We collect them in seen order, then reverse so oldest is first (index 0)
-    and newest is last — matching the original sidebar display logic.
-    """
-    seen = {}   # thread_id -> title, insertion order = newest checkpoint first
 
-    for checkpoint in checkpointer.list(None):
-        thread_id = checkpoint.config['configurable'].get('thread_id')
-        if thread_id in seen:
-            # Already captured the latest checkpoint for this thread — skip older ones
-            continue
-        title = checkpoint.checkpoint.get('channel_values', {}).get('title', 'New Chat')
-        seen[thread_id] = title
-
-    # Reverse so the dict is oldest→newest (sidebar shows reversed list, newest at top)
+# =============================================================================
+# Thread helpers
+# =============================================================================
+def retreive_all_threads() -> dict:
+    """Return {thread_id: title} ordered oldest → newest."""
+    seen: Dict[str, str] = {}
+    for cp in checkpointer.list(None):
+        tid = cp.config['configurable'].get('thread_id')
+        if tid not in seen:
+            seen[tid] = cp.checkpoint.get('channel_values', {}).get('title', 'New Chat')
     return dict(reversed(list(seen.items())))
 
-# ------------------------ Delete a thread ------------------------
-def delete_thread(thread_id):
-    """
-    Deletes all checkpoints associated with a thread_id from the SQLite DB.
-    Dynamically checks which tables exist to handle different LangGraph versions.
-    """
-    # Get all table names in the DB that have a thread_id column
-    tables = connect.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-    table_names = [t[0] for t in tables]
 
-    for table in table_names:
-        # Check if this table has a thread_id column before deleting
-        columns = [col[1] for col in connect.execute(f"PRAGMA table_info({table})").fetchall()]
-        if "thread_id" in columns:
-            connect.execute(f"DELETE FROM {table} WHERE thread_id = ?", (thread_id,))
-
-    connect.commit()
-
-def thread_has_document(thread_id:str)->bool:
-    return str(thread_id) in _THREAD_RETRIEVERS
-
-def thread_document_metadata(thread_id:str)-> dict:
-    return _THREAD_METADATA.get(str(thread_id),{})
+def delete_thread(thread_id: str) -> None:
+    """Delete all checkpoints for a thread from SQLite."""
+    tables = _db_conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()
+    for (table,) in tables:
+        cols = [r[1] for r in _db_conn.execute(f'PRAGMA table_info({table})').fetchall()]
+        if 'thread_id' in cols:
+            _db_conn.execute(f'DELETE FROM {table} WHERE thread_id = ?', (thread_id,))
+    _db_conn.commit()
