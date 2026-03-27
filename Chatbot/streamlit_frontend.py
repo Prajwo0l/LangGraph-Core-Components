@@ -341,11 +341,12 @@ with tab_chat:
                     # Show intent badge when router result arrives
                     if hasattr(chunk, 'intent') and chunk.intent:
                         intent_icons = {
-                            'expense':  '💸',
-                            'search':   '🔍',
-                            'document': '📄',
-                            'finance':  '📈',
-                            'general':  '💬',
+                            'expense':    '💸',
+                            'filesystem': '🗂️',
+                            'search':     '🔍',
+                            'document':   '📄',
+                            'finance':    '📈',
+                            'general':    '💬',
                         }
                         icon = intent_icons.get(chunk.intent, '🧠')
                         tool_count = len(TOOL_GROUPS.get(chunk.intent, []))

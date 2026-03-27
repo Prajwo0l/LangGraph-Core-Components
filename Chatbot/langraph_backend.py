@@ -196,7 +196,14 @@ async def _load_mcp_tools() -> list:
             'args': [r'C:\Users\lamic\Desktop\Expense MCP Server\main.py'],
             'transport': 'stdio',
             'cwd': r'C:\Users\lamic\Desktop\Expense MCP Server',
-        }
+        },
+        # ── NEW: Filesystem server (sandboxed to Downloads folder) ──────────────
+        'filesystem': {
+            'command': r'C:\Users\lamic\Desktop\File-System-MCP-Server\.venv\Scripts\python.exe',
+            'args': [r'C:\Users\lamic\Desktop\File-System-MCP-Server\main.py'],
+            'transport': 'stdio',
+            'cwd': r'C:\Users\lamic\Desktop\File-System-MCP-Server',
+        },
     })
     return await client.get_tools()
 
@@ -218,10 +225,24 @@ tools = [search_tool, calculator, get_stock_price, rag_tool] + mcp_tools
 # Pull out mcp tools by name for grouping
 _mcp_by_name = {t.name: t for t in mcp_tools}
 
+# Separate MCP tools by server for fine-grained routing
+_expense_tools = [t for t in mcp_tools if t.name in {
+    'add_expense', 'add_to_calendar', 'list_expenses', 'summarize',
+    'set_budget', 'list_budgets', 'check_budget_alerts', 'delete_budget',
+    'add_credit', 'list_credits', 'edit_credit', 'delete_credit',
+    'edit_expense', 'delete_expense', 'monthly_overview',
+}]
+_filesystem_tools = [t for t in mcp_tools if t.name in {
+    'list_files', 'read_file', 'write_file', 'delete_file',
+}]
+
 # Tool groups — each intent gets only the tools it needs
 TOOL_GROUPS: Dict[str, list] = {
-    # expense: add/list/summarize expenses + calendar
-    'expense': [t for t in mcp_tools],
+    # expense: all expense + budget + credit tools
+    'expense': _expense_tools,
+
+    # filesystem: read/write/list/delete files in Downloads
+    'filesystem': _filesystem_tools,
 
     # search: web search only
     'search': [search_tool],
@@ -253,7 +274,7 @@ llm_with_tools = llm.bind_tools(tools)
 # Fast small LLM just for intent classification
 _router_llm = ChatOpenAI(model='gpt-4o-mini', temperature=0, max_retries=2)
 
-INTENTS = ['expense', 'search', 'document', 'finance', 'general']
+INTENTS = ['expense', 'filesystem', 'search', 'document', 'finance', 'general']
 
 def intent_router(state: ChatState) -> dict:
     """
@@ -274,7 +295,8 @@ def intent_router(state: ChatState) -> dict:
     classification = _router_llm.invoke([
         SystemMessage(content=(
             'You are an intent classifier. Classify the user message into EXACTLY one of these intents:\n'
-            '- expense: user wants to add, list, or summarize expenses\n'
+            '- expense: user wants to add, list, edit, delete, or summarize expenses, budgets, or income\n'
+            '- filesystem: user wants to list, read, write, or delete files on their computer or Downloads folder\n'
             '- search: user wants to search the web or find current information\n'
             '- document: user is asking about an uploaded PDF or document\n'
             '- finance: user wants stock prices or math calculations\n'
@@ -301,11 +323,12 @@ def chat_node(state: ChatState) -> dict:
 
     # System prompt tailored per intent
     intent_hints = {
-        'expense':  'You are helping the user track expenses. Use expense tools to add, list or summarize.',
-        'search':   'You are helping the user find information. Use the search tool to look things up.',
-        'document': 'You are helping the user understand an uploaded PDF. Use the rag_tool to retrieve context.',
-        'finance':  'You are helping the user with financial data. Use get_stock_price or calculator as needed.',
-        'general':  'You are having a friendly conversation. No tools needed unless the user asks explicitly.',
+        'expense':    'You are helping the user track expenses, budgets, and income. Use expense tools to add, list, edit, or summarize.',
+        'filesystem': 'You are helping the user manage files in their Downloads folder. Use list_files, read_file, write_file, or delete_file as needed.',
+        'search':     'You are helping the user find information. Use the search tool to look things up.',
+        'document':   'You are helping the user understand an uploaded PDF. Use the rag_tool to retrieve context.',
+        'finance':    'You are helping the user with financial data. Use get_stock_price or calculator as needed.',
+        'general':    'You are having a friendly conversation. No tools needed unless the user asks explicitly.',
     }
 
     system = SystemMessage(content=(
