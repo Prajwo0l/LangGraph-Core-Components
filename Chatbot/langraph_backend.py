@@ -41,7 +41,7 @@ warnings.filterwarnings('ignore', message='could not convert string to float')
 BASE_DIR = Path(r'C:\Users\lamic\Downloads').resolve()
 
 # ── Filesystem tools that require human approval before executing ──
-FS_HITL_TOOLS = {'write_file', 'delete_file'}
+FS_HITL_TOOLS = {'write_file', 'delete_file', 'delete_folder'}
 
 # ── Filesystem tools that are safe to run without approval ──
 FS_AUTO_TOOLS = {'list_files', 'read_file'}
@@ -240,7 +240,7 @@ _expense_tools = [t for t in mcp_tools if t.name in {
     'edit_expense', 'delete_expense', 'monthly_overview',
 }]
 _filesystem_tools = [t for t in mcp_tools if t.name in {
-    'list_files', 'read_file', 'write_file', 'delete_file',
+    'list_files', 'read_file', 'write_file', 'delete_file', 'delete_folder',
 }]
 
 TOOL_GROUPS: Dict[str, list] = {
@@ -330,10 +330,66 @@ async def _invoke_tool(t: Any, args: dict) -> str:
 
 def execute_tool_call(tool_name: str, args: dict) -> str:
     """
-    Public helper — execute any tool by name synchronously.
-    Used by the frontend for HITL approvals so it can run a tool
-    directly without going through the LangGraph graph.
+    Public helper — execute a HITL-approved tool synchronously.
+    Used by the frontend after the user approves a write_file or delete_file action.
+
+    WHY we bypass _invoke_tool for MCP filesystem tools:
+      MCP tools communicate over a stdio subprocess that was opened once at startup
+      inside asyncio.run(_load_mcp_tools()). That event loop is gone by the time
+      the frontend calls this function. Calling asyncio.run() again creates a NEW
+      loop with no live MCP connection, so the MCP call silently returns nothing —
+      write_file appears to work (file was already written by the graph), but
+      delete_file does nothing because the MCP subprocess isn't reachable.
+
+      Solution: for the two filesystem HITL tools we perform the operation DIRECTLY
+      in Python using pathlib — same sandbox logic as the MCP server, no subprocess needed.
     """
+    # ── Direct pathlib execution for filesystem HITL tools ───────────────────
+    if tool_name == 'delete_file':
+        path_arg = args.get('path', '')
+        try:
+            p = (BASE_DIR / path_arg).resolve()
+            if not str(p).startswith(str(BASE_DIR)):
+                return f"Access denied: '{path_arg}' is outside the Downloads directory."
+            if not p.exists():
+                return f"File does not exist: {path_arg}"
+            if not p.is_file():
+                return f"'{path_arg}' is a directory — use delete_folder to remove directories."
+            p.unlink()
+            return f"File deleted: {path_arg}"
+        except Exception as exc:
+            return f"delete_file error: {exc}"
+
+    if tool_name == 'delete_folder':
+        import shutil
+        path_arg = args.get('path', '')
+        try:
+            p = (BASE_DIR / path_arg).resolve()
+            if not str(p).startswith(str(BASE_DIR)):
+                return f"Access denied: '{path_arg}' is outside the Downloads directory."
+            if not p.exists():
+                return f"Folder does not exist: {path_arg}"
+            if not p.is_dir():
+                return f"'{path_arg}' is a file — use delete_file to remove files."
+            shutil.rmtree(p)
+            return f"Folder deleted: {path_arg}"
+        except Exception as exc:
+            return f"delete_folder error: {exc}"
+
+    if tool_name == 'write_file':
+        path_arg = args.get('path', '')
+        content  = args.get('content', '')
+        try:
+            p = (BASE_DIR / path_arg).resolve()
+            if not str(p).startswith(str(BASE_DIR)):
+                return f"Access denied: '{path_arg}' is outside the Downloads directory."
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding='utf-8')
+            return f"File written successfully: {p}"
+        except Exception as exc:
+            return f"write_file error: {exc}"
+
+    # ── Fallback for any other tool (non-MCP LangChain tools) ────────────────
     t = _tools_by_name.get(tool_name)
     if t is None:
         return json.dumps({'error': f"Tool '{tool_name}' not found."})

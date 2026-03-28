@@ -313,12 +313,19 @@ with tab_chat:
                 reject_label  = '❌ No, cancel'
                 warning_note  = '⚠️ This will create or overwrite the file.'
 
-            else:  # delete_file
+            elif tool_name == 'delete_file':
                 st.markdown('### 🗑️ Confirm File Deletion')
-                st.write(f"Pattie wants to **permanently delete** `{args.get('path')}` from your Downloads folder.")
+                st.write(f"Pattie wants to **permanently delete** the file `{args.get('path')}` from your Downloads folder.")
                 approve_label = '✅ Yes, delete it'
                 reject_label  = '❌ No, keep it'
                 warning_note  = '🚨 This cannot be undone.'
+
+            else:  # delete_folder
+                st.markdown('### 🗁️ Confirm Folder Deletion')
+                st.write(f"Pattie wants to **permanently delete the folder** `{args.get('path')}` and **all its contents** from your Downloads folder.")
+                approve_label = '✅ Yes, delete the folder'
+                reject_label  = '❌ No, keep it'
+                warning_note  = '🚨 This will delete the folder AND everything inside it. This cannot be undone.'
 
             st.caption(warning_note)
             col_a, col_r = st.columns(2)
