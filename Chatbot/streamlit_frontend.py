@@ -24,6 +24,13 @@ from langraph_backend import (
     TOOL_GROUPS,
     tools,
     _invoke_tool,
+    # Memory exports
+    get_stm_summary,
+    clear_stm,
+    get_all_ltm_facts,
+    get_ltm_profile,
+    delete_ltm_fact,
+    clear_all_ltm,
 )
 
 # Path to the expense database
@@ -207,7 +214,7 @@ st.title('✨ Pattie')
 st.caption('Your personal AI assistant — chat, search, track expenses, read documents.')
 st.divider()
 
-tab_chat, tab_dashboard = st.tabs(['💬 Chat', '📊 Expense Dashboard'])
+tab_chat, tab_dashboard, tab_memory = st.tabs(['💬 Chat', '📊 Expense Dashboard', '🧠 Memory'])
 
 
 # =============================================================================
@@ -586,3 +593,141 @@ with tab_dashboard:
                 mime='text/csv',
                 use_container_width=True,
             )
+
+
+# =============================================================================
+# TAB 3 — Memory
+# =============================================================================
+with tab_memory:
+    st.subheader('🧠 Pattie’s Memory')
+    st.caption(
+        'Pattie automatically remembers things about you across all conversations. '
+        'Short-term memory (STM) is per-chat; long-term memory (LTM) is global.'
+    )
+
+    # =========================================================================
+    # STM SECTION
+    # =========================================================================
+    st.markdown('---')
+    st.markdown('### 📝 Short-Term Memory (current thread)')
+    st.caption(
+        f'After **10 messages** the older messages are compressed into a rolling summary. '
+        f'The last **8 messages** are always kept verbatim in context.'
+    )
+
+    current_tid = st.session_state.get('thread_id', '')
+    stm_summary = get_stm_summary(current_tid) if current_tid else None
+
+    if stm_summary:
+        with st.container(border=True):
+            st.markdown('**Current thread summary:**')
+            st.write(stm_summary)
+        col_stm1, col_stm2 = st.columns([3, 1])
+        with col_stm2:
+            if st.button('🗑️ Clear STM for this thread', use_container_width=True):
+                clear_stm(current_tid)
+                st.success('STM cleared for this thread.')
+                st.rerun()
+    else:
+        st.info('💭 No STM summary yet for the current thread — it will appear once the conversation exceeds 10 messages.')
+
+    # Show STM summaries for other threads
+    with st.expander('📂 View summaries from other threads', expanded=False):
+        other_threads = [
+            (t, n) for t, n in st.session_state.chat_threads.items() if t != current_tid
+        ]
+        if not other_threads:
+            st.write('No other threads found.')
+        else:
+            for t_id, t_name in other_threads:
+                summary = get_stm_summary(t_id)
+                if summary:
+                    st.markdown(f'**{t_name}** (`{t_id[:8]}…`)')
+                    st.write(summary)
+                    st.divider()
+
+    # =========================================================================
+    # LTM SECTION
+    # =========================================================================
+    st.markdown('---')
+    st.markdown('### 🧠 Long-Term Memory (cross-thread)')
+    st.caption(
+        'Atomic facts extracted from all your conversations. '
+        'Available in every thread. Stored in a FAISS vector index on disk.'
+    )
+
+    # — User profile card —
+    profile = get_ltm_profile()
+    has_profile = any([
+        profile.get('name'), profile.get('location'), profile.get('occupation'),
+        profile.get('preferences'), profile.get('goals'), profile.get('expertise'),
+        profile.get('other'),
+    ])
+
+    if has_profile:
+        with st.container(border=True):
+            st.markdown('👤 **Structured User Profile**')
+            col_p1, col_p2 = st.columns(2)
+            with col_p1:
+                if profile.get('name'):
+                    st.write(f'🏷️ **Name:** {profile["name"]}')
+                if profile.get('location'):
+                    st.write(f'📍 **Location:** {profile["location"]}')
+                if profile.get('occupation'):
+                    st.write(f'💼 **Occupation:** {profile["occupation"]}')
+            with col_p2:
+                for pref in (profile.get('preferences') or [])[:4]:
+                    st.write(f'❤️ {pref}')
+                for goal in (profile.get('goals') or [])[:3]:
+                    st.write(f'🎯 {goal}')
+            for skill in (profile.get('expertise') or [])[:3]:
+                st.write(f'✨ **Expertise:** {skill}')
+            for item in (profile.get('other') or [])[:3]:
+                st.write(f'📌 {item}')
+    else:
+        st.info('🔍 No user profile built yet — Pattie will learn about you as you chat.')
+
+    # — All atomic facts —
+    st.markdown('🔬 **Atomic Facts**')
+    all_facts = get_all_ltm_facts()
+
+    if not all_facts:
+        st.info('📦 No facts stored yet. Chat with Pattie and she will start remembering things about you!')
+    else:
+        st.caption(f'{len(all_facts)} fact(s) stored across all conversations.')
+
+        # Search / filter
+        search_q = st.text_input('🔍 Filter facts…', placeholder='Type to filter', label_visibility='collapsed')
+        displayed = [
+            f for f in reversed(all_facts)
+            if not search_q or search_q.lower() in f['text'].lower()
+        ]
+
+        if not displayed:
+            st.warning('No facts match your filter.')
+        else:
+            for i, fact in enumerate(displayed):
+                col_f1, col_f2 = st.columns([6, 1])
+                with col_f1:
+                    thread_label = st.session_state.chat_threads.get(
+                        fact.get('thread_id', ''), fact.get('thread_id', 'unknown')[:8]
+                    )
+                    added = fact.get('added_at', '')[:10]
+                    st.markdown(
+                        f'💡 {fact["text"]}  '
+                        f'<span style="color:grey;font-size:0.75em">— from *{thread_label}* on {added}</span>',
+                        unsafe_allow_html=True
+                    )
+                with col_f2:
+                    if st.button('🗑️', key=f'del_fact_{i}_{fact["text"][:20]}', help='Delete this fact'):
+                        if delete_ltm_fact(fact['text']):
+                            st.success('Fact deleted.')
+                        else:
+                            st.warning('Fact not found.')
+                        st.rerun()
+
+        st.divider()
+        if st.button('🚨 Clear ALL Long-Term Memory', type='secondary', use_container_width=False):
+            clear_all_ltm()
+            st.warning('⚠️ All long-term memory has been wiped.')
+            st.rerun()

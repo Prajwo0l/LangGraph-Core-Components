@@ -32,6 +32,25 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from typing import TypedDict
 
+# ── Memory (STM + LTM) ──
+from memory import (
+    apply_stm,
+    build_memory_context,
+    update_ltm,
+    get_stm_summary,
+    clear_stm,
+    get_all_ltm_facts,
+    get_ltm_profile,
+    delete_ltm_fact,
+    clear_all_ltm,
+)
+
+# Re-export memory helpers so streamlit_frontend only needs to import from langraph_backend
+__all_memory__ = [
+    'get_stm_summary', 'clear_stm',
+    'get_all_ltm_facts', 'get_ltm_profile', 'delete_ltm_fact', 'clear_all_ltm',
+]
+
 # ── Environment ──
 load_dotenv()
 os.environ['LANGCHAIN_PROJECT'] = 'Personal Chatbot'
@@ -274,23 +293,30 @@ Classify the user message into EXACTLY one of these intents:
 - expense    : user wants to add, list, edit, delete, or summarize expenses, budgets, or income
 - filesystem : user wants to list, read/open, write, delete, or access a file or folder on their computer
 - search     : user wants to search the web or find current information online
-- document   : user is asking a question about a PDF that has ALREADY been loaded/read this session
+- document   : user is asking a question about a PDF or document (uploaded or already loaded in this session)
 - finance    : user wants stock prices or math / arithmetic calculations
 - general    : casual conversation, greetings, or anything that does not fit the above
 
 CRITICAL RULES:
 
-1. If the user mentions a filename (e.g. "resume.pdf", "report.pdf", "notes.txt")
-   AND asks to read / open / show / describe / summarize it → intent is ALWAYS "filesystem".
-   The file must be fetched from disk first. Do NOT classify this as "document".
+1. If the user says things like "summarize the pdf", "explain the document",
+   "what does the pdf say", "what is in the uploaded file", "tell me about my resume",
+   "summarize what I uploaded" — intent is ALWAYS "document".
+   The user already uploaded it; no filesystem access is needed.
 
-2. "document" intent is ONLY correct when the user asks a follow-up question about a file
-   that was ALREADY opened earlier in the conversation AND no new filename is being requested.
+2. If the user mentions a specific filename AND asks to fetch it from their computer
+   (e.g. "open report.pdf from my Downloads") → intent is "filesystem".
 
-3. Phrases like "from my filesystem", "from Downloads", "open the file", "read the file",
-   "write to", "save to", "delete the file" are strong signals for "filesystem".
+3. "document" intent is correct when:
+   - The user refers to content of an already-uploaded/opened file.
+   - The user uses words like: summarize, explain, describe, extract, what does it say, who is.
 
-4. If unsure between "filesystem" and "document", choose "filesystem".
+4. "filesystem" intent is correct when:
+   - The user explicitly wants to access/list/write/delete files on their computer.
+   - The user mentions a path, folder, or "Downloads".
+
+5. If unsure between "filesystem" and "document", choose "document" if a file
+   was already mentioned as uploaded in this session.
 
 Reply with ONLY the intent word. No explanation. No punctuation.\
 """
@@ -301,6 +327,32 @@ def intent_router(state: ChatState) -> dict:
         (m.content for m in reversed(state['messages']) if isinstance(m, HumanMessage)),
         ''
     )
+
+    # ── Short-circuit: if a PDF is already loaded for this thread,
+    #    and the user isn't asking about a NEW file → force 'document'
+    active_tid = _ACTIVE_THREAD_ID or 'default'
+    doc_loaded = thread_has_document(active_tid)
+
+    # Keywords that suggest the user wants to work with the already-loaded doc
+    _DOC_TRIGGERS = (
+        'summarize', 'summary', 'explain', 'describe', 'what does',
+        'what is', 'tell me about', 'extract', 'list', 'who', 'when',
+        'where', 'how many', 'pdf', 'document', 'resume', 'cv',
+        'uploaded', 'the file', 'this file',
+    )
+    # Keywords that suggest a NEW filesystem operation
+    _FS_TRIGGERS = (
+        'download', 'downloads folder', 'open the file', 'read the file',
+        'from my computer', 'from downloads', 'write to', 'delete',
+    )
+
+    msg_lower = last_human.lower()
+    wants_fs  = any(t in msg_lower for t in _FS_TRIGGERS)
+    wants_doc = any(t in msg_lower for t in _DOC_TRIGGERS)
+
+    if doc_loaded and wants_doc and not wants_fs:
+        return {'intent': 'document'}
+
     classification = _router_llm.invoke([
         SystemMessage(content=_INTENT_SYSTEM_PROMPT),
         HumanMessage(content=last_human),
@@ -308,6 +360,12 @@ def intent_router(state: ChatState) -> dict:
     intent = classification.content.strip().lower()
     if intent not in INTENTS:
         intent = 'general'
+
+    # ── Safety override: if doc is loaded and LLM picks filesystem/general
+    #    for a doc-like query (no explicit FS trigger), redirect to document
+    if doc_loaded and intent in ('filesystem', 'general') and wants_doc and not wants_fs:
+        intent = 'document'
+
     return {'intent': intent}
 
 
@@ -560,8 +618,9 @@ def fs_hitl_node(state: ChatState) -> dict:
 
 def chat_node(state: ChatState) -> dict:
     """Main LLM node — uses only the tools relevant to the detected intent."""
-    today  = date.today().strftime('%Y-%m-%d')
-    intent = state.get('intent', 'general')
+    today      = date.today().strftime('%Y-%m-%d')
+    intent     = state.get('intent', 'general')
+    thread_id  = _ACTIVE_THREAD_ID or 'default'
 
     active_llm = _llm_by_intent.get(intent, llm_with_tools)
 
@@ -583,15 +642,31 @@ def chat_node(state: ChatState) -> dict:
         'general':    'You are having a friendly conversation. No tools needed unless the user explicitly asks.',
     }
 
+    # ── Apply STM: compress old messages, keep last 8 recent ──────────────────
+    stm_messages = apply_stm(thread_id, state['messages'])
+
+    # ── Get last human message for LTM retrieval ──────────────────────────────
+    last_human_content = next(
+        (m.content for m in reversed(stm_messages) if isinstance(m, HumanMessage)),
+        ''
+    )
+
+    # ── Build LTM memory context ───────────────────────────────────────────────
+    memory_context = build_memory_context(thread_id, stm_messages, last_human_content)
+
+    # ── Compose system message ────────────────────────────────────────────────
+    memory_section = f'\n\n{memory_context}' if memory_context else ''
+
     system = SystemMessage(content=(
         f'You are Pattie, a helpful personal AI assistant.\n'
         f"Today's date is {today}.\n"
         f'When adding expenses, use {today} if the user does not specify a date.\n'
         f'Always pass all required arguments when calling tools.\n'
         f'Current task: {intent_hints.get(intent, "")}'
+        f'{memory_section}'
     ))
 
-    response = active_llm.invoke([system] + state['messages'])
+    response = active_llm.invoke([system] + stm_messages)
     return {'messages': [response]}
 
 
@@ -601,7 +676,9 @@ def chat_node(state: ChatState) -> dict:
 
 def tool_node(state: ChatState) -> dict:
     """Execute every tool call in the last AI message."""
-    last    = state['messages'][-1]
+    last = state['messages'][-1]
+    if not isinstance(last, AIMessage) or not getattr(last, 'tool_calls', None):
+        return {}
     results = []
     for call in last.tool_calls:
         t = _tools_by_name.get(call['name'])
@@ -616,6 +693,44 @@ def tool_node(state: ChatState) -> dict:
     return {'messages': results}
 
 
+def ltm_update_node(state: ChatState) -> dict:
+    """
+    After the assistant produces a final response (no more tool calls),
+    extract atomic facts from the last exchange and update LTM.
+    This runs asynchronously in a background thread so the user sees no delay.
+    """
+    thread_id = _ACTIVE_THREAD_ID or 'default'
+    messages  = state['messages']
+
+    # Find the last Human + last AI message pair
+    last_ai = next(
+        (m for m in reversed(messages)
+         if isinstance(m, AIMessage) and not getattr(m, 'tool_calls', None)),
+        None
+    )
+    last_human = next(
+        (m for m in reversed(messages) if isinstance(m, HumanMessage)),
+        None
+    )
+
+    if last_ai and last_human:
+        ai_content = last_ai.content
+        if isinstance(ai_content, list):
+            ai_content = ' '.join(
+                p.get('text', '') for p in ai_content if isinstance(p, dict)
+            )
+        try:
+            update_ltm(
+                thread_id=thread_id,
+                human_msg=last_human.content,
+                ai_msg=str(ai_content),
+            )
+        except Exception:
+            pass   # LTM update is best-effort; never crash the chat
+
+    return {}   # no state changes
+
+
 # =============================================================================
 # Graph routing
 # =============================================================================
@@ -624,16 +739,20 @@ def _after_chat(state: ChatState) -> str:
     """
     Decide what happens after chat_node:
 
-      1. No tool calls at all          → END  (final answer)
+      1. No tool calls at all          → ltm_update  (extract facts, then END)
       2. read_file on a .pdf           → pdf_ingest  (bypass tool_node)
-      3. write_file or delete_file     → fs_hitl     (pause for approval)
-      4. Any other tool call           → tools  (execute normally)
+      3. write_file / delete_file      → fs_hitl     (pause for approval)
+      4. Any other tool call           → tools       (execute normally)
+
+    CRITICAL: every tool_call_id in the last AIMessage MUST get a paired
+    ToolMessage before the graph ends, otherwise OpenAI raises a 400.
+    All branches here guarantee that.
     """
     last = state['messages'][-1]
 
-    # No tool calls → done
+    # No tool calls → update LTM then end
     if not isinstance(last, AIMessage) or not getattr(last, 'tool_calls', None):
-        return END
+        return 'ltm_update'
 
     # PDF read intercept (must check before HITL — read_file on .pdf is auto)
     if _find_pdf_read_call(state['messages']) is not None:
@@ -643,7 +762,7 @@ def _after_chat(state: ChatState) -> str:
     if _find_fs_hitl_call(state['messages']) is not None:
         return 'fs_hitl'
 
-    # Normal tool execution
+    # All other tool calls (including any stray read_file on non-PDFs) → tools
     return 'tools'
 
 
@@ -657,6 +776,7 @@ _graph.add_node('chat_node',     chat_node)
 _graph.add_node('tools',         tool_node)
 _graph.add_node('pdf_ingest',    pdf_ingest_node)
 _graph.add_node('fs_hitl',       fs_hitl_node)
+_graph.add_node('ltm_update',    ltm_update_node)
 
 # Flow
 _graph.add_edge(START, 'intent_router')
@@ -665,9 +785,10 @@ _graph.add_edge('intent_router', 'chat_node')
 _graph.add_conditional_edges(
     'chat_node',
     _after_chat,
-    {END: END, 'pdf_ingest': 'pdf_ingest', 'fs_hitl': 'fs_hitl', 'tools': 'tools'},
+    {END: END, 'ltm_update': 'ltm_update', 'pdf_ingest': 'pdf_ingest', 'fs_hitl': 'fs_hitl', 'tools': 'tools'},
 )
 
+_graph.add_edge('ltm_update', END)    # LTM updated → done
 _graph.add_edge('tools',      'chat_node')   # normal loop
 _graph.add_edge('pdf_ingest', 'chat_node')   # after PDF load → answer from RAG
 _graph.add_edge('fs_hitl',    END)           # pause here; frontend resumes after approval
@@ -680,11 +801,46 @@ CHATBOT_CONFIG_DEFAULTS = {'recursion_limit': 25}
 # Thread helpers
 # =============================================================================
 def retreive_all_threads() -> dict:
+    """
+    Retrieve all threads directly from SQLite, bypassing the SqliteSaver.list()
+    serializer which is broken in some langgraph-checkpoint-sqlite versions
+    (AttributeError: 'JsonPlusSerializer' object has no attribute 'loads').
+    """
     seen: Dict[str, str] = {}
-    for cp in checkpointer.list(None):
-        tid = cp.config['configurable'].get('thread_id')
-        if tid not in seen:
-            seen[tid] = cp.checkpoint.get('channel_values', {}).get('title', 'New Chat')
+    try:
+        # Try the normal LangGraph API first
+        for cp in checkpointer.list(None):
+            tid = cp.config['configurable'].get('thread_id')
+            if tid not in seen:
+                seen[tid] = cp.checkpoint.get('channel_values', {}).get('title', 'New Chat')
+    except (AttributeError, Exception):
+        # Fallback: query SQLite directly to list threads + titles
+        try:
+            rows = _db_conn.execute(
+                "SELECT DISTINCT thread_id FROM checkpoints ORDER BY checkpoint_id DESC"
+            ).fetchall()
+            for (tid,) in rows:
+                if tid in seen:
+                    continue
+                # Try to extract the title from the checkpoint blob directly
+                title = 'New Chat'
+                try:
+                    blob_row = _db_conn.execute(
+                        "SELECT checkpoint FROM checkpoints WHERE thread_id = ? ORDER BY checkpoint_id DESC LIMIT 1",
+                        (tid,)
+                    ).fetchone()
+                    if blob_row:
+                        import json as _json
+                        data = _json.loads(blob_row[0])
+                        title = (
+                            data.get('channel_values', {}).get('title')
+                            or 'New Chat'
+                        )
+                except Exception:
+                    pass
+                seen[tid] = title
+        except Exception:
+            pass
     return dict(reversed(list(seen.items())))
 
 

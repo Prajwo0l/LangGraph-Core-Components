@@ -1,0 +1,50 @@
+{
+  "facts": [
+    {
+      "text": "The user's name is Prajwol Lamichhane.",
+      "thread_id": "65f3694c-f815-4e89-aae6-b0aafb4f15ab",
+      "added_at": "2026-04-04T03:51:21.522002"
+    },
+    {
+      "text": "Prajwol is aspiring to be an AI Engineer.",
+      "thread_id": "879e2af3-a6bb-452a-bb26-8637c3121278",
+      "added_at": "2026-04-04T03:59:26.664571"
+    },
+    {
+      "text": "Prajwol has hands-on experience in developing multi-agent systems.",
+      "thread_id": "879e2af3-a6bb-452a-bb26-8637c3121278",
+      "added_at": "2026-04-04T03:59:26.664578"
+    },
+    {
+      "text": "Prajwol is seeking an AI Agent Developer Internship.",
+      "thread_id": "879e2af3-a6bb-452a-bb26-8637c3121278",
+      "added_at": "2026-04-04T03:59:26.664583"
+    },
+    {
+      "text": "Prajwol aims to create reliable, production-ready AI solutions.",
+      "thread_id": "879e2af3-a6bb-452a-bb26-8637c3121278",
+      "added_at": "2026-04-04T03:59:26.664586"
+    },
+    {
+      "text": "Prajwol wants to contribute to real-world global deployments in AI.",
+      "thread_id": "879e2af3-a6bb-452a-bb26-8637c3121278",
+      "added_at": "2026-04-04T03:59:26.664590"
+    }
+  ],
+  "profile": {
+    "name": "Prajwol Lamichhane",
+    "location": null,
+    "occupation": "Aspiring AI Engineer",
+    "preferences": [],
+    "goals": [
+      "Create reliable, production-ready AI solutions",
+      "Contribute to real-world global deployments in AI"
+    ],
+    "expertise": [
+      "Developing multi-agent systems"
+    ],
+    "other": [
+      "Seeking an AI Agent Developer Internship"
+    ]
+  }
+}
