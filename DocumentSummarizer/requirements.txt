@@ -1,0 +1,18 @@
+# ── Core LLM & Orchestration ──────────────────────────────────────────────────
+openai>=1.30.0
+langgraph>=0.2.0
+langchain-core>=0.2.0
+
+# ── PDF Parsing ───────────────────────────────────────────────────────────────
+pymupdf>=1.24.0          # primary PDF parser (import as `fitz`)
+pdfplumber>=0.11.0       # fallback PDF parser
+
+# ── Tokenisation ─────────────────────────────────────────────────────────────
+tiktoken>=0.7.0
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0     # load OPENAI_API_KEY from .env
+
+# ── Dev / Testing (optional but recommended) ─────────────────────────────────
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
