@@ -1,0 +1,118 @@
+{
+  "facts": [
+    {
+      "text": "User's name is Prajwol Lamichhane.",
+      "thread_id": "ce592f2d-204a-4731-8a39-44e2c3c0e962",
+      "added_at": "2026-04-07T12:25:07.042328"
+    },
+    {
+      "text": "User is located in Kathmandu, Nepal.",
+      "thread_id": "ce592f2d-204a-4731-8a39-44e2c3c0e962",
+      "added_at": "2026-04-07T12:25:50.736430"
+    },
+    {
+      "text": "User's email is plamichhane563@gmail.com.",
+      "thread_id": "ce592f2d-204a-4731-8a39-44e2c3c0e962",
+      "added_at": "2026-04-07T12:25:50.736438"
+    },
+    {
+      "text": "User's phone number is +977 9803562993.",
+      "thread_id": "ce592f2d-204a-4731-8a39-44e2c3c0e962",
+      "added_at": "2026-04-07T12:25:50.736441"
+    },
+    {
+      "text": "User is an aspiring AI engineer.",
+      "thread_id": "ce592f2d-204a-4731-8a39-44e2c3c0e962",
+      "added_at": "2026-04-07T12:25:50.736445"
+    },
+    {
+      "text": "User has hands-on experience building multi-agent systems.",
+      "thread_id": "ce592f2d-204a-4731-8a39-44e2c3c0e962",
+      "added_at": "2026-04-07T12:25:50.736449"
+    },
+    {
+      "text": "User has experience with RAG pipelines.",
+      "thread_id": "ce592f2d-204a-4731-8a39-44e2c3c0e962",
+      "added_at": "2026-04-07T12:25:50.736452"
+    },
+    {
+      "text": "User has experience with LLM fine-tuning workflows.",
+      "thread_id": "ce592f2d-204a-4731-8a39-44e2c3c0e962",
+      "added_at": "2026-04-07T12:25:50.736455"
+    },
+    {
+      "text": "User is seeking an AI Agent Developer Internship.",
+      "thread_id": "ce592f2d-204a-4731-8a39-44e2c3c0e962",
+      "added_at": "2026-04-07T12:25:50.736458"
+    },
+    {
+      "text": "User wants to apply skills in LangGraph.",
+      "thread_id": "ce592f2d-204a-4731-8a39-44e2c3c0e962",
+      "added_at": "2026-04-07T12:25:50.736461"
+    },
+    {
+      "text": "User wants to apply skills in MCP.",
+      "thread_id": "ce592f2d-204a-4731-8a39-44e2c3c0e962",
+      "added_at": "2026-04-07T12:25:50.736464"
+    },
+    {
+      "text": "User wants to develop scalable LLM systems.",
+      "thread_id": "ce592f2d-204a-4731-8a39-44e2c3c0e962",
+      "added_at": "2026-04-07T12:25:50.736467"
+    },
+    {
+      "text": "User aims to develop reliable, production-ready AI solutions.",
+      "thread_id": "ce592f2d-204a-4731-8a39-44e2c3c0e962",
+      "added_at": "2026-04-07T12:25:50.736469"
+    },
+    {
+      "text": "User wants to contribute to real-world global deployments.",
+      "thread_id": "ce592f2d-204a-4731-8a39-44e2c3c0e962",
+      "added_at": "2026-04-07T12:25:50.736472"
+    },
+    {
+      "text": "User is interested in developing scalable LLM systems.",
+      "thread_id": "29d1f947-b1cd-4f84-8a4c-a72e562b89b1",
+      "added_at": "2026-04-07T12:27:29.150077"
+    },
+    {
+      "text": "User has skills in MCP.",
+      "thread_id": "29d1f947-b1cd-4f84-8a4c-a72e562b89b1",
+      "added_at": "2026-04-07T12:27:29.150087"
+    },
+    {
+      "text": "User has skills in LangGraph.",
+      "thread_id": "29d1f947-b1cd-4f84-8a4c-a72e562b89b1",
+      "added_at": "2026-04-07T12:27:29.150094"
+    },
+    {
+      "text": "User has a brother named Bishesh.",
+      "thread_id": "301ea56a-3b5f-42c8-bf5d-5b60bfa44580",
+      "added_at": "2026-04-09T09:54:28.515372"
+    }
+  ],
+  "profile": {
+    "name": "Prajwol Lamichhane",
+    "location": "Kathmandu, Nepal",
+    "occupation": "Aspiring AI Engineer",
+    "preferences": [],
+    "goals": [
+      "Seeking an AI Agent Developer Internship",
+      "Develop scalable LLM systems",
+      "Develop reliable, production-ready AI solutions",
+      "Contribute to real-world global deployments"
+    ],
+    "expertise": [
+      "Hands-on experience building multi-agent systems",
+      "Experience with RAG pipelines",
+      "Experience with LLM fine-tuning workflows",
+      "Skills in LangGraph",
+      "Skills in MCP"
+    ],
+    "other": [
+      "User's email is plamichhane563@gmail.com",
+      "User's phone number is +977 9803562993",
+      "User has a brother named Bishesh."
+    ]
+  }
+}

@@ -1,6 +1,12 @@
 # =============================================================================
 # streamlit_frontend.py  —  Pattie AI Assistant Frontend
 # =============================================================================
+# MIGRATION NOTE:
+#   Previously imported from `langraph_backend` (monolithic file).
+#   Now imports from the `pattie` package (clean modular structure).
+#   Everything else in this file is unchanged.
+# =============================================================================
+import asyncio as _asyncio
 import csv
 import io
 import json
@@ -11,9 +17,9 @@ from datetime import date
 import streamlit as st
 from langchain_core.messages import HumanMessage, ToolMessage
 
-from langraph_backend import (
+# ── New import block — one clean package instead of one giant module ──────────
+from pattie import (
     CHATBOT_CONFIG_DEFAULTS,
-    chatbot,
     delete_thread,
     execute_tool_call,
     ingest_pdf,
@@ -23,8 +29,7 @@ from langraph_backend import (
     thread_has_document,
     TOOL_GROUPS,
     tools,
-    _invoke_tool,
-    # Memory exports
+    # Memory
     get_stm_summary,
     clear_stm,
     get_all_ltm_facts,
@@ -32,9 +37,12 @@ from langraph_backend import (
     delete_ltm_fact,
     clear_all_ltm,
 )
+from pattie.graph import build_graph
+from pattie.tools.executor import invoke_tool_async
+from pattie.config import EXPENSE_DB, FS_HITL_TOOLS
 
-# Path to the expense database
-EXPENSE_DB = r'C:\Users\lamic\Desktop\Expense MCP Server\expenses.db'
+# Build the compiled graph once at startup
+chatbot = build_graph()
 
 
 # =============================================================================
@@ -110,7 +118,6 @@ def _reset_chat() -> None:
     _register_thread(tid)
     st.session_state.message_history = []
     st.session_state.pop('last_upload_key', None)
-    # Clear any pending HITL
     st.session_state.hitl_pending    = None
     st.session_state.fs_hitl_pending = None
 
@@ -157,9 +164,9 @@ def _get_config(tid: str, title: str) -> dict:
 # Session state bootstrap
 # =============================================================================
 if 'hitl_pending'    not in st.session_state:
-    st.session_state.hitl_pending    = None   # expense → calendar approval
+    st.session_state.hitl_pending    = None
 if 'fs_hitl_pending' not in st.session_state:
-    st.session_state.fs_hitl_pending = None   # filesystem write/delete approval
+    st.session_state.fs_hitl_pending = None
 
 if 'chat_threads' not in st.session_state:
     st.session_state.chat_threads = retreive_all_threads()
@@ -196,7 +203,7 @@ with st.sidebar:
         c1, c2 = st.columns([5, 1])
         with c1:
             if st.button(label, key=f'thread_{_tid}', use_container_width=True):
-                st.session_state.thread_id      = _tid
+                st.session_state.thread_id       = _tid
                 st.session_state.message_history = _load_history(_tid)
                 st.session_state.fs_hitl_pending = None
                 st.session_state.hitl_pending    = None
@@ -246,7 +253,8 @@ with tab_chat:
     if not st.session_state.message_history:
         st.info(
             '👋 Hello! I can search the web, do maths, look up stock prices, '
-            'track your expenses (+ Google Calendar), manage files in your Downloads folder, '
+            'track your expenses (+ Google Calendar), manage files in your Downloads folder '
+            '(including reading or writing multiple files at once), '
             'or answer questions from a PDF. Just ask!'
         )
 
@@ -279,8 +287,7 @@ with tab_chat:
                             st.error('⚠️ Calendar tool not found.')
                         else:
                             try:
-                                import asyncio as _asyncio
-                                _asyncio.run(_invoke_tool(cal_tool, {
+                                _asyncio.run(invoke_tool_async(cal_tool, {
                                     'date':     expense['date'],
                                     'amount':   expense['amount'],
                                     'category': expense['category'],
@@ -299,7 +306,8 @@ with tab_chat:
                     st.rerun()
 
     # =========================================================================
-    # HITL 2 — Filesystem write_file / delete_file approval
+    # HITL 2 — Filesystem destructive-op approval
+    # Handles: write_file | write_multiple_files | delete_file | delete_folder
     # =========================================================================
     if st.session_state.fs_hitl_pending:
         pending      = st.session_state.fs_hitl_pending
@@ -320,19 +328,40 @@ with tab_chat:
                 reject_label  = '❌ No, cancel'
                 warning_note  = '⚠️ This will create or overwrite the file.'
 
+            elif tool_name == 'write_multiple_files':
+                # ── NEW: multi-file write approval ───────────────────────────
+                files: dict = args.get('files', {})
+                st.markdown('### 🗂️ Confirm Multi-File Write')
+                st.write(f"Pattie wants to write **{len(files)} file(s)** to your Downloads folder:")
+                for path, content in files.items():
+                    preview = str(content)
+                    if len(preview) > 200:
+                        preview = preview[:200] + '\n…(truncated)'
+                    with st.expander(f'📄 `{path}`', expanded=False):
+                        st.code(preview, language='text')
+                approve_label = f'✅ Yes, write all {len(files)} files'
+                reject_label  = '❌ No, cancel'
+                warning_note  = '⚠️ This will create or overwrite all listed files.'
+
             elif tool_name == 'delete_file':
                 st.markdown('### 🗑️ Confirm File Deletion')
-                st.write(f"Pattie wants to **permanently delete** the file `{args.get('path')}` from your Downloads folder.")
+                st.write(
+                    f"Pattie wants to **permanently delete** `{args.get('path')}` "
+                    f"from your Downloads folder."
+                )
                 approve_label = '✅ Yes, delete it'
                 reject_label  = '❌ No, keep it'
                 warning_note  = '🚨 This cannot be undone.'
 
             else:  # delete_folder
                 st.markdown('### 🗁️ Confirm Folder Deletion')
-                st.write(f"Pattie wants to **permanently delete the folder** `{args.get('path')}` and **all its contents** from your Downloads folder.")
+                st.write(
+                    f"Pattie wants to **permanently delete the folder** `{args.get('path')}` "
+                    f"and **all its contents** from your Downloads folder."
+                )
                 approve_label = '✅ Yes, delete the folder'
                 reject_label  = '❌ No, keep it'
-                warning_note  = '🚨 This will delete the folder AND everything inside it. This cannot be undone.'
+                warning_note  = '🚨 This will delete the folder AND everything inside it. Cannot be undone.'
 
             st.caption(warning_note)
             col_a, col_r = st.columns(2)
@@ -340,57 +369,49 @@ with tab_chat:
             with col_a:
                 if st.button(approve_label, use_container_width=True, type='primary'):
                     with st.spinner(f'Running {tool_name}…'):
-                        # 1. Execute the tool directly
                         result_str = execute_tool_call(tool_name, args)
-
-                        # 2. Inject the real result back into LangGraph state
-                        #    so the graph knows the tool completed and can continue
                         config = _get_config(current_tid, '')
                         chatbot.update_state(
                             config,
                             {
-                                'messages':       [ToolMessage(content=result_str, tool_call_id=tool_call_id)],
+                                'messages':        [ToolMessage(content=result_str, tool_call_id=tool_call_id)],
                                 'fs_hitl_pending': None,
                             },
                             as_node='fs_hitl',
                         )
-
-                        # 3. Resume streaming so the LLM produces a final response
                         resume_text = ''
                         with st.chat_message('assistant'):
                             placeholder = st.empty()
                             for chunk, _ in chatbot.stream(
-                                None,              # None = resume from current state
+                                None,
                                 config=config,
                                 stream_mode='messages',
                             ):
                                 if hasattr(chunk, 'content') and chunk.content and not isinstance(chunk, ToolMessage):
                                     resume_text += chunk.content
                                     placeholder.markdown(resume_text)
-
                         if resume_text:
                             st.session_state.message_history.append(
                                 {'role': 'assistant', 'content': resume_text}
                             )
-
                     st.session_state.fs_hitl_pending = None
                     st.rerun()
 
             with col_r:
                 if st.button(reject_label, use_container_width=True):
-                    # Inject a cancelled ToolMessage so LangGraph state is consistent
-                    config = _get_config(current_tid, '')
-                    cancel_msg = f"Action cancelled by user. Do not attempt {tool_name} again unless explicitly asked."
+                    config     = _get_config(current_tid, '')
+                    cancel_msg = (
+                        f"Action cancelled by user. "
+                        f"Do not attempt {tool_name} again unless explicitly asked."
+                    )
                     chatbot.update_state(
                         config,
                         {
-                            'messages':       [ToolMessage(content=cancel_msg, tool_call_id=tool_call_id)],
+                            'messages':        [ToolMessage(content=cancel_msg, tool_call_id=tool_call_id)],
                             'fs_hitl_pending': None,
                         },
                         as_node='fs_hitl',
                     )
-
-                    # Resume so the LLM acknowledges the cancellation
                     resume_text = ''
                     with st.chat_message('assistant'):
                         placeholder = st.empty()
@@ -402,12 +423,10 @@ with tab_chat:
                             if hasattr(chunk, 'content') and chunk.content and not isinstance(chunk, ToolMessage):
                                 resume_text += chunk.content
                                 placeholder.markdown(resume_text)
-
                     if resume_text:
                         st.session_state.message_history.append(
                             {'role': 'assistant', 'content': resume_text}
                         )
-
                     st.session_state.fs_hitl_pending = None
                     st.rerun()
 
@@ -427,7 +446,6 @@ with tab_chat:
 
         set_active_thread(current_tid)
 
-        # Clear any stale HITL state before new turn
         st.session_state.hitl_pending    = None
         st.session_state.fs_hitl_pending = None
         new_expense_hitl = None
@@ -456,9 +474,9 @@ with tab_chat:
             try:
                 for chunk, _meta in chatbot.stream(
                     {
-                        'messages':       [HumanMessage(content=user_input)],
-                        'title':          current_title,
-                        'intent':         'general',
+                        'messages':        [HumanMessage(content=user_input)],
+                        'title':           current_title,
+                        'intent':          'general',
                         'fs_hitl_pending': None,
                     },
                     config=config,
@@ -472,12 +490,11 @@ with tab_chat:
                             f'{icon} **{chunk.intent}** mode — {tool_count} tool(s) available'
                         )
 
-                    # Tool call status
+                    # Tool call status badge
                     if hasattr(chunk, 'tool_calls') and chunk.tool_calls:
                         for tc in chunk.tool_calls:
                             name = tc.get('name', 'tool')
-                            # Show a different label for HITL tools
-                            if name in ('write_file', 'delete_file'):
+                            if name in FS_HITL_TOOLS:
                                 label = f'⏸️ {name} — waiting for approval…'
                             else:
                                 label = f'🔧 {name}…'
@@ -486,12 +503,14 @@ with tab_chat:
                                 s.update(label=f'✅ {name} staged', state='complete', expanded=False)
 
                     elif isinstance(chunk, ToolMessage):
-                        # ── Detect expense HITL (calendar) ───────────────────
+                        # Detect expense calendar HITL trigger
                         try:
                             result = json.loads(chunk.content)
-                            if (isinstance(result, dict)
-                                    and result.get('status') == 'ok'
-                                    and 'category' in result):
+                            if (
+                                isinstance(result, dict)
+                                and result.get('status') == 'ok'
+                                and 'category' in result
+                            ):
                                 new_expense_hitl = {
                                     'date':     result.get('date', ''),
                                     'amount':   result.get('amount', 0),
@@ -512,14 +531,13 @@ with tab_chat:
 
         st.session_state.message_history.append({'role': 'assistant', 'content': response_text})
 
-        # ── After stream: check LangGraph state for fs_hitl_pending ──────────
+        # Check LangGraph state for fs_hitl_pending after stream ends
         graph_state = chatbot.get_state(config)
         fs_pending  = graph_state.values.get('fs_hitl_pending')
         if fs_pending:
             st.session_state.fs_hitl_pending = fs_pending
             st.rerun()
 
-        # ── After stream: set expense calendar HITL if detected ──────────────
         if new_expense_hitl:
             st.session_state.hitl_pending = new_expense_hitl
             st.rerun()
@@ -599,14 +617,14 @@ with tab_dashboard:
 # TAB 3 — Memory
 # =============================================================================
 with tab_memory:
-    st.subheader('🧠 Pattie’s Memory')
+    st.subheader('🧠 Pattie\'s Memory')
     st.caption(
         'Pattie automatically remembers things about you across all conversations. '
         'Short-term memory (STM) is per-chat; long-term memory (LTM) is global.'
     )
 
     # =========================================================================
-    # STM SECTION
+    # STM
     # =========================================================================
     st.markdown('---')
     st.markdown('### 📝 Short-Term Memory (current thread)')
@@ -629,9 +647,8 @@ with tab_memory:
                 st.success('STM cleared for this thread.')
                 st.rerun()
     else:
-        st.info('💭 No STM summary yet for the current thread — it will appear once the conversation exceeds 10 messages.')
+        st.info('💭 No STM summary yet — will appear once the conversation exceeds 10 messages.')
 
-    # Show STM summaries for other threads
     with st.expander('📂 View summaries from other threads', expanded=False):
         other_threads = [
             (t, n) for t, n in st.session_state.chat_threads.items() if t != current_tid
@@ -647,7 +664,7 @@ with tab_memory:
                     st.divider()
 
     # =========================================================================
-    # LTM SECTION
+    # LTM
     # =========================================================================
     st.markdown('---')
     st.markdown('### 🧠 Long-Term Memory (cross-thread)')
@@ -656,7 +673,6 @@ with tab_memory:
         'Available in every thread. Stored in a FAISS vector index on disk.'
     )
 
-    # — User profile card —
     profile = get_ltm_profile()
     has_profile = any([
         profile.get('name'), profile.get('location'), profile.get('occupation'),
@@ -687,7 +703,6 @@ with tab_memory:
     else:
         st.info('🔍 No user profile built yet — Pattie will learn about you as you chat.')
 
-    # — All atomic facts —
     st.markdown('🔬 **Atomic Facts**')
     all_facts = get_all_ltm_facts()
 
@@ -695,8 +710,6 @@ with tab_memory:
         st.info('📦 No facts stored yet. Chat with Pattie and she will start remembering things about you!')
     else:
         st.caption(f'{len(all_facts)} fact(s) stored across all conversations.')
-
-        # Search / filter
         search_q = st.text_input('🔍 Filter facts…', placeholder='Type to filter', label_visibility='collapsed')
         displayed = [
             f for f in reversed(all_facts)
@@ -716,7 +729,7 @@ with tab_memory:
                     st.markdown(
                         f'💡 {fact["text"]}  '
                         f'<span style="color:grey;font-size:0.75em">— from *{thread_label}* on {added}</span>',
-                        unsafe_allow_html=True
+                        unsafe_allow_html=True,
                     )
                 with col_f2:
                     if st.button('🗑️', key=f'del_fact_{i}_{fact["text"][:20]}', help='Delete this fact'):
