@@ -1,19 +1,5 @@
 """
 agents/final_writer_agent.py — Produces the final, polished document summary.
-
-Takes the reviewed section summaries and writes a clean, coherent, well-
-structured final summary in the user's chosen output mode.
-
-Output schema
-─────────────
-{
-  "title": "<document title>",
-  "section_summaries": [
-    {"section_id": 0, "title": "...", "summary": "..."},
-    ...
-  ],
-  "final_summary": "<full combined summary>"
-}
 """
 
 import json
@@ -25,29 +11,31 @@ from utils.logger import get_logger
 
 log = get_logger(__name__)
 
-# ─── Prompt templates ────────────────────────────────────────────────────────
-
 _SYSTEM = (
     "You are a world-class technical writer. "
     "You synthesize multiple section summaries into a single, fluent, "
-    "well-structured final summary that reads as a standalone document."
+    "well-structured final summary that reads as a standalone document. "
+    "IMPORTANT: Your response must be valid JSON. "
+    "Never use raw newlines or unescaped quotes inside JSON string values. "
+    "Use \\n for newlines and \\\" for quotes inside strings."
 )
 
 _MODE_INSTRUCTIONS: dict[str, str] = {
     "bullet": (
         "Write the final summary as structured bullet points grouped by section. "
-        "Each section should have a heading followed by its key points."
+        "Each section should have a heading followed by its key points. "
+        "In the JSON string, separate bullet points with \\n- (escaped newline + dash)."
     ),
     "paragraph": (
         "Write the final summary as flowing prose. "
         "Blend the section summaries into a coherent narrative with smooth transitions. "
-        "Use clear paragraph breaks between major topics."
+        "Use \\n\\n (escaped double newline) between major paragraphs in the JSON string."
     ),
 }
 
 _DEPTH_LENGTH: dict[str, str] = {
-    "short": "Keep the final summary under 200 words.",
-    "medium": "Aim for 300–500 words.",
+    "short":    "Keep the final summary under 200 words.",
+    "medium":   "Aim for 300–500 words.",
     "detailed": "Aim for 600–1000 words; preserve important details.",
 }
 
@@ -66,30 +54,27 @@ Ensure:
 - Consistent terminology throughout
 - Clarity and readability
 
-Respond ONLY with a valid JSON object (no markdown):
+CRITICAL JSON RULES:
+- Respond ONLY with the JSON object below — no markdown, no explanation before or after.
+- All string values must be valid JSON strings: escape newlines as \\n, quotes as \\".
+- Do NOT include raw (unescaped) line breaks inside any string value.
+
 {{
   "title": "{doc_title}",
   "section_summaries": [
     {{"section_id": <int>, "title": "<title>", "summary": "<section summary>"}},
     ...
   ],
-  "final_summary": "<complete final summary>"
+  "final_summary": "<complete final summary — use \\n\\n between paragraphs, no raw newlines>"
 }}
 """
 
-
-# ─── Public function ─────────────────────────────────────────────────────────
 
 def run_final_writer(
     doc_title: str,
     reviewed_sections: list[dict[str, Any]],
     cfg: Config,
 ) -> dict[str, Any]:
-    """
-    Generate the final summary document.
-
-    Returns the output schema dict shown above.
-    """
     if not reviewed_sections:
         log.warning("Final writer: no reviewed sections to synthesize.")
         return {
@@ -111,7 +96,7 @@ def run_final_writer(
     ]
     reviewed_json = json.dumps(compact, indent=2, ensure_ascii=False)
 
-    mode_instruction = _MODE_INSTRUCTIONS.get(cfg.output_mode, _MODE_INSTRUCTIONS["paragraph"])
+    mode_instruction  = _MODE_INSTRUCTIONS.get(cfg.output_mode,    _MODE_INSTRUCTIONS["paragraph"])
     depth_instruction = _DEPTH_LENGTH.get(cfg.summary_depth, _DEPTH_LENGTH["medium"])
 
     prompt = _PROMPT_TEMPLATE.format(

@@ -11,7 +11,7 @@ Pipeline nodes (LangGraph StateGraph):
   └────┬─────┘
        │
   ┌────▼─────┐
-  │  work    │  Worker agents run in parallel (asyncio)
+  │  work    │  Worker agents run TRULY in parallel (ThreadPoolExecutor)
   └────┬─────┘
        │
   ┌────▼──────┐
@@ -25,10 +25,24 @@ Pipeline nodes (LangGraph StateGraph):
   ┌────▼──────┐
   │  output   │  Format & return result
   └───────────┘
+
+WHY ThreadPoolExecutor instead of asyncio
+─────────────────────────────────────────
+run_worker() is a plain synchronous blocking function (it calls the OpenAI
+REST API and waits). For blocking I/O-bound work, threads are the correct
+and simplest parallelism primitive:
+
+  • asyncio.gather() only gives true concurrency for *async* coroutines.
+    Wrapping a sync function with run_in_executor still uses threads under
+    the hood — so we might as well use ThreadPoolExecutor directly.
+  • ThreadPoolExecutor works identically in a plain script, inside a
+    LangGraph node, and inside Jupyter — no event-loop juggling required.
+  • concurrent.futures.as_completed() lets results stream in as they finish
+    rather than blocking on each one in turn.
 """
 
-import asyncio
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Optional, TypedDict
 
 from langgraph.graph import StateGraph, END
@@ -108,45 +122,90 @@ def node_plan(state: PipelineState) -> PipelineState:
 
 
 def node_work(state: PipelineState) -> PipelineState:
-    """Run worker agents concurrently using asyncio."""
+    """
+    Run all worker agents truly in parallel using ThreadPoolExecutor.
+
+    How it works
+    ────────────
+    1. A ThreadPoolExecutor is created with max_workers threads.
+    2. Every section gets its own future: pool.submit(run_worker, section, cfg)
+    3. as_completed() yields each future the moment it finishes — workers are
+       NOT waited on one-by-one; they all run at the same time (up to the
+       thread limit) and results are collected as they arrive.
+    4. Results are sorted by section_id at the end to restore document order.
+
+    Example with 6 sections and max_workers=4
+    ──────────────────────────────────────────
+    t=0s  → sections 0,1,2,3 start simultaneously
+    t=2s  → section 1 finishes first  → collected immediately
+    t=3s  → section 0 finishes        → section 4 starts
+    t=3s  → section 3 finishes        → section 5 starts
+    t=4s  → sections 2,4,5 finish
+    Total wall-clock ≈ 4s  (vs 12s+ sequential)
+    """
     if state.get("error"):
         return state
 
     t0 = time.perf_counter()
-    log.info("=== NODE: work (%d sections) ===", len(state["sections"]))
-
     cfg = state["cfg"]
     sections = state["sections"]
+    total = len(sections)
 
-    async def run_all_workers() -> list[dict]:
-        sem = asyncio.Semaphore(cfg.max_workers)
+    log.info("=== NODE: work (%d sections, max_workers=%d) ===", total, cfg.max_workers)
 
-        async def bounded_worker(section: dict) -> dict:
-            async with sem:
-                loop = asyncio.get_event_loop()
-                return await loop.run_in_executor(None, run_worker, section, cfg)
-
-        tasks = [bounded_worker(sec) for sec in sections]
-        return await asyncio.gather(*tasks)
+    outputs: list[dict] = []
 
     try:
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as pool:
-                    futures = [pool.submit(run_worker, sec, cfg) for sec in sections]
-                    outputs = [f.result() for f in futures]
-            else:
-                outputs = loop.run_until_complete(run_all_workers())
-        except RuntimeError:
-            outputs = asyncio.run(run_all_workers())
+        with ThreadPoolExecutor(max_workers=cfg.max_workers) as pool:
+            # Submit ALL sections at once — they start running immediately
+            future_to_section = {
+                pool.submit(run_worker, section, cfg): section
+                for section in sections
+            }
 
+            finished = 0
+            for future in as_completed(future_to_section):
+                section = future_to_section[future]
+                finished += 1
+                try:
+                    result = future.result()
+                    outputs.append(result)
+                    log.info(
+                        "Worker[%d] ✓ finished (%d/%d)  '%s'",
+                        section["section_id"],
+                        finished,
+                        total,
+                        section.get("title", "")[:50],
+                    )
+                except Exception as exc:
+                    # Individual worker failure — log and continue; don't crash pipeline
+                    log.error(
+                        "Worker[%d] ✗ failed (%d/%d): %s",
+                        section["section_id"],
+                        finished,
+                        total,
+                        exc,
+                    )
+                    outputs.append({
+                        "section_id": section["section_id"],
+                        "title": section.get("title", ""),
+                        "key_points": [],
+                        "summary": f"[Worker failed: {exc}]",
+                    })
+
+        # Restore document order (workers finish in arbitrary order)
         outputs.sort(key=lambda x: x.get("section_id", 0))
         state["worker_outputs"] = outputs
-        log.info("Workers completed – %d summaries produced.", len(outputs))
+        elapsed = time.perf_counter() - t0
+        log.info(
+            "All workers done. %d/%d succeeded. Wall-clock: %.2fs",
+            sum(1 for o in outputs if not o["summary"].startswith("[Worker failed")),
+            total,
+            elapsed,
+        )
+
     except Exception as exc:
-        log.error("Work node failed: %s", exc)
+        log.error("node_work: unexpected error – %s", exc)
         state["error"] = str(exc)
         state["worker_outputs"] = []
 

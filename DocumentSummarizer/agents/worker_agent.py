@@ -3,6 +3,16 @@ agents/worker_agent.py — Summarises a single document section.
 
 Each call is independent so that workers can run concurrently.
 
+FIX — Blunt character hard-cap:
+  The old code used `text[:8000]` (character slice) as a context-window guard.
+  8 000 characters ≈ 2 000 tokens for plain English, but can be far fewer for
+  code-heavy or non-Latin text, or far more for sparse/whitespace-heavy text.
+
+  New design: use count_tokens() (already available in utils/chunker) to
+  measure the actual token count, then truncate at the token boundary using
+  tiktoken's encode/decode round-trip.  This ensures we never exceed the
+  model's context regardless of language or document type.
+
 Output schema (per section)
 ───────────────────────────
 {
@@ -15,11 +25,18 @@ Output schema (per section)
 
 from typing import Any
 
+import tiktoken
+
 from config import Config
 from utils.llm_client import call_llm
+from utils.chunker import count_tokens
 from utils.logger import get_logger
 
 log = get_logger(__name__)
+
+# Hard token limit for a single worker's input text.
+# Leaves headroom for the prompt template + JSON response within max_tokens=4096.
+_MAX_INPUT_TOKENS = 3000
 
 # ─── Prompt templates ────────────────────────────────────────────────────────
 
@@ -70,6 +87,32 @@ Respond ONLY with a valid JSON object (no markdown, no extra text):
 """
 
 
+# ─── Token-safe text truncation ───────────────────────────────────────────────
+
+def _truncate_to_tokens(text: str, max_tokens: int, model: str) -> str:
+    """
+    Return *text* truncated to at most *max_tokens* tokens using tiktoken's
+    encode/decode round-trip.  This is accurate regardless of language,
+    character width, or whitespace density.
+    """
+    try:
+        enc = tiktoken.encoding_for_model(model)
+    except KeyError:
+        enc = tiktoken.get_encoding("cl100k_base")
+
+    token_ids = enc.encode(text)
+    if len(token_ids) <= max_tokens:
+        return text                         # already within limit
+
+    truncated = enc.decode(token_ids[:max_tokens])
+    log.debug(
+        "Worker: text truncated from %d to %d tokens.",
+        len(token_ids),
+        max_tokens,
+    )
+    return truncated
+
+
 # ─── Public function ─────────────────────────────────────────────────────────
 
 def run_worker(section: dict[str, Any], cfg: Config) -> dict[str, Any]:
@@ -93,14 +136,23 @@ def run_worker(section: dict[str, Any], cfg: Config) -> dict[str, Any]:
             "summary": "(Empty section)",
         }
 
+    # Token-accurate truncation (fixes the blunt char-slice bug)
+    actual_tokens = count_tokens(text, cfg.model)
+    if actual_tokens > _MAX_INPUT_TOKENS:
+        text = _truncate_to_tokens(text, _MAX_INPUT_TOKENS, cfg.model)
+        log.info(
+            "Worker[%d]: input truncated from %d → %d tokens.",
+            section_id, actual_tokens, _MAX_INPUT_TOKENS,
+        )
+
     log.info("Worker[%d]: summarising section '%s' …", section_id, title[:60])
 
     depth_instruction = _DEPTH_INSTRUCTIONS.get(cfg.summary_depth, _DEPTH_INSTRUCTIONS["medium"])
-    mode_instruction = _MODE_INSTRUCTIONS.get(cfg.output_mode, _MODE_INSTRUCTIONS["paragraph"])
+    mode_instruction  = _MODE_INSTRUCTIONS.get(cfg.output_mode,    _MODE_INSTRUCTIONS["paragraph"])
 
     prompt = _PROMPT_TEMPLATE.format(
         title=title,
-        text=text[:8000],               # hard cap to stay within context window
+        text=text,
         depth_instruction=depth_instruction,
         mode_instruction=mode_instruction,
         section_id=section_id,
@@ -108,7 +160,6 @@ def run_worker(section: dict[str, Any], cfg: Config) -> dict[str, Any]:
 
     try:
         result = call_llm(prompt, cfg, system_prompt=_SYSTEM, expect_json=True)
-        # Ensure required keys exist
         result.setdefault("section_id", section_id)
         result.setdefault("title", title)
         result.setdefault("key_points", [])
